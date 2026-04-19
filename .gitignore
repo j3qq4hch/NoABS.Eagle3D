@@ -1,0 +1,87 @@
+# Ignore list for Eagle, a PCB layout tool
+
+# Backup files
+*.s#?
+*.b#?
+*.l#?
+*.b$?
+*.s$?
+*.l$?
+*.workspace
+
+# Eagle project file
+# It contains a serial number and references to the file structure
+# on your computer.
+# comment the following line if you want to have your project file included.
+eagle.epf
+
+# Autorouter files
+*.pro
+*.job
+
+# CAM files
+*.$$$
+*.cmp
+*.ly2
+*.l15
+*.sol
+*.plc
+*.stc
+*.sts
+*.crc
+*.crs
+*.dri
+*.gpi
+*.pls
+*.ger
+*.gpi
+*.drd
+*.drd.*
+
+*.s#*
+*.b#*
+
+*.info
+
+*.eps
+
+# file locks introduced since 7.x
+*.lck
+
+# SketchUp garbage
+*.skb
+*.pdf
+/manf/*
+
+/
+
+!*.ewp
+!*.s
+!*.icf
+/software/pt-1.4/doc
+/miniWLED/manf
+/src/PT4115/manf
+/grosso/manf
+software/pt-1.4/README-VISUAL-C++.txt
+software/pt-1.4/README
+software/pt-1.4/Makefile
+software/CLI/.mxproject
+
+software/.vscode/
+/__pycache__
+/glue/__pycache__
+/dickpic
+/TMP
+*.glb
+*.brd
+/software/__pycache__
+/glue/drawexe_bundle
+/glue/build
+/glue/dist
+/release_artifacts/drawexe_bundle/bin
+/release_artifacts
+/drawexe_bundle
+/build
+/build_venv
+/NoABS_tmp
+/.claude

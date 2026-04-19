@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>GLB Viewer Test</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #111; overflow: hidden; }
+  #canvas { display: block; width: 100vw; height: calc(100vh - 40px); }
+  #bar {
+    height: 40px; background: #1e1e1e; border-top: 1px solid #333;
+    display: flex; align-items: center; padding: 0 12px; gap: 12px;
+  }
+  #status { font: 12px monospace; color: #aaa; flex: 1; }
+  button {
+    padding: 4px 12px; background: #333; color: #ccc;
+    border: 1px solid #555; border-radius: 3px; cursor: pointer; font-size: 12px;
+  }
+  button:hover { background: #444; }
+</style>
+</head>
+<body>
+
+<canvas id="canvas"></canvas>
+
+<div id="bar">
+  <span id="status">Инициализация...</span>
+  <button onclick="Viewer.resetCamera()">Reset camera</button>
+  <button onclick="autoCenter()">Auto center</button>
+</div>
+
+<script>
+  // Инициализируем Viewer после загрузки Three.js + viewer.js
+  function _boot() {
+    var s1 = document.createElement("script"); s1.src = "three.min.js";
+    s1.onload = function() {
+      var s2 = document.createElement("script"); s2.src = "viewer.js";
+      s2.onload = function() {
+        Viewer.init(document.getElementById("canvas"));
+        setStatus("Viewer готов, загружаю model.glb...");
+        waitApi();
+      };
+      s2.onerror = function() { setStatus("ОШИБКА: viewer.js не загрузился"); };
+      document.head.appendChild(s2);
+    };
+    s1.onerror = function() { setStatus("ОШИБКА: three.min.js не загрузился"); };
+    document.head.appendChild(s1);
+  }
+
+  function setStatus(msg) {
+    document.getElementById("status").textContent = msg;
+  }
+
+  // Ждём pywebview API (может появиться не сразу)
+  function waitApi(tries) {
+    tries = tries || 0;
+    if (typeof pywebview !== "undefined" && pywebview.api) {
+      loadModel();
+    } else if (tries < 50) {
+      setTimeout(function() { waitApi(tries + 1); }, 100);
+    } else {
+      setStatus("ОШИБКА: pywebview API не появился за 5 секунд");
+    }
+  }
+
+  function loadModel() {
+    setStatus("Запрашиваю model.glb от Python...");
+    pywebview.api.get_model_glb().then(function(result) {
+      if (result.error) {
+        setStatus("ОШИБКА: " + result.error);
+        return;
+      }
+      setStatus("GLB получен (" + result.size + " байт), парсю...");
+      return Viewer.loadComponentGLB(result.glb).then(function(info) {
+        setStatus("Готово  [" + info + "]");
+      });
+    }).catch(function(e) {
+      setStatus("ОШИБКА при загрузке: " + e);
+    });
+  }
+
+  function autoCenter() {
+    Viewer.autoPlace();
+    Viewer.resetCamera();
+  }
+
+  window.addEventListener("DOMContentLoaded", _boot);
+</script>
+</body>
+</html>

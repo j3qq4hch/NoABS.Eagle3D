@@ -1,0 +1,224 @@
+#usage "Export board textures and generate 3D GLB model.\nUsage: RUN export3d.ulp [CLEAN]"
+
+string win_path(string s)
+{
+  string result = s;
+  int i;
+  for (i = 0; result[i]; i++)
+    if (result[i] == '/') result[i] = '\\';
+  return result;
+}
+
+string read_ini_value(string ini_path, string key)
+{
+  string lines[];
+  int n = fileread(lines, ini_path);
+  int klen = strlen(key);
+  string result = "";
+  int i;
+  for (i = 0; i < n; i++)
+  {
+    if (strsub(lines[i], 0, klen + 1) == key + "=")
+    {
+      result = strsub(lines[i], klen + 1);
+      int rlen = strlen(result);
+      if (rlen > 0 && result[rlen-1] == '\n') { result[rlen-1] = '\0'; rlen--; }
+      if (rlen > 0 && result[rlen-1] == '\r') { result[rlen-1] = '\0'; }
+    }
+  }
+  return result;
+}
+
+void main()
+{
+  // ── Проверяем аргумент CLEAN ─────────────────────────────────────────────
+  if (argc >= 2 && argv[1] == "CLEAN")
+  {
+    if (!board)
+    {
+      dlgMessageBox("Error: no .brd file is open.");
+      exit(1);
+    }
+    string bd, tmp;
+    board(B) { bd = filedir(B.name); tmp = bd + "NoABS_tmp/"; }
+    system("cmd.exe /c rmdir /s /q \"" + win_path(tmp) + "\" 2>nul");
+    dlgMessageBox("NoABS_tmp cleaned (including settings):\n" + tmp);
+    exit(0);
+  }
+
+  if (!board)
+  {
+    dlgMessageBox("Error: no .brd file is open.");
+    exit(1);
+  }
+
+  // ── Определяем пути ───────────────────────────────────────────────────────
+  string board_dir, brd_stem, brd_full, tmp_dir, textures_dir;
+  board(B)
+  {
+    board_dir    = filedir(B.name);
+    brd_stem     = filesetext(filename(B.name), "");
+    brd_full     = B.name;
+    tmp_dir      = board_dir + "NoABS_tmp/";
+    textures_dir = tmp_dir + brd_stem + "_textures/";
+  }
+
+  // Путь к settings.ini — в папке NoABS_tmp рядом с BRD
+  string settings_ini = tmp_dir + "export3d_settings.ini";
+
+  // ── Настройки: значения по умолчанию ─────────────────────────────────────
+  int    dpi     = 400;
+  string exe_dir = filedir(argv[0]);
+  string glb_dir = "";
+
+  // Загружаем сохранённые настройки если есть
+  if (filesize(settings_ini) > 0)
+  {
+    string dpi_str = read_ini_value(settings_ini, "dpi");
+    if (strlen(dpi_str) > 0) dpi = strtol(dpi_str);
+    string ed = read_ini_value(settings_ini, "exe_dir");
+    if (strlen(ed) > 0) exe_dir = ed;
+    string gd = read_ini_value(settings_ini, "glb_dir");
+    glb_dir = gd;  // может быть пустым — это нормально
+  }
+
+  // ── Создаём NoABS_tmp заранее, чтобы можно было записать settings.ini ──────
+  system("cmd.exe /c mkdir \"" + win_path(tmp_dir) + "\" 2>nul");
+
+  // ── Диалог (показываем только если нет сохранённых настроек или нужна правка)
+  int show_dialog = (filesize(settings_ini) <= 0);
+
+  // Если настройки есть — сразу запускаем без диалога
+  // Если нет — показываем диалог для первоначальной настройки
+  if (show_dialog)
+  {
+    if (dlgDialog("Export 3D — Initial Setup")
+    {
+      dlgLabel("Settings will be saved and reused on next run.");
+      dlgGroup("Image export")
+      {
+        dlgHBoxLayout
+        {
+          dlgLabel("DPI:");
+          dlgIntEdit(dpi, 1, 9999);
+          dlgStretch(1);
+        }
+      }
+      dlgGroup("Tools")
+      {
+        dlgHBoxLayout
+        {
+          dlgLabel("Tools dir:");
+          dlgStringEdit(exe_dir);
+          dlgPushButton("...") exe_dir = dlgDirectory("Select tools directory", exe_dir);
+        }
+      }
+      dlgGroup("Components (optional)")
+      {
+        dlgHBoxLayout
+        {
+          dlgLabel("GLB dir:");
+          dlgStringEdit(glb_dir);
+          dlgPushButton("...") glb_dir = dlgDirectory("Select GLB components directory", glb_dir);
+        }
+      }
+      dlgHBoxLayout
+      {
+        dlgPushButton("+OK")     dlgAccept();
+        dlgPushButton("-Cancel") dlgReject();
+      }
+    } != 1)
+      exit(0);
+
+    // Сохраняем настройки
+    string dpi_save;
+    sprintf(dpi_save, "%d", dpi);
+    output(settings_ini, "wt")
+    {
+      printf("dpi=%s\n",     dpi_save);
+      printf("exe_dir=%s\n", exe_dir);
+      printf("glb_dir=%s\n", glb_dir);
+    }
+  }
+
+  // ── Создаём папку текстур ────────────────────────────────────────────────
+  system("cmd.exe /c mkdir \"" + win_path(textures_dir) + "\" 2>nul");
+  system("cmd.exe /c del /f /q \"" + win_path(textures_dir) + "*.png\"");
+
+  // ── step1.log ────────────────────────────────────────────────────────────
+  output(win_path(tmp_dir + "step1.log"), "wt")
+  {
+    printf("board_dir   = %s\n", board_dir);
+    printf("brd_stem    = %s\n", brd_stem);
+    printf("brd_full    = %s\n", brd_full);
+    printf("tmp_dir     = %s\n", tmp_dir);
+    printf("textures_dir= %s\n", textures_dir);
+    printf("exe_dir     = %s\n", exe_dir);
+    printf("glb_dir     = %s\n", glb_dir);
+    printf("settings_ini= %s\n", settings_ini);
+  }
+
+  // ── ini для step2 ────────────────────────────────────────────────────────
+  string ini_path = tmp_dir + "export3d.ini";
+  output(ini_path, "wt")
+  {
+    printf("exe_dir=%s\n",  exe_dir);
+    printf("brd_full=%s\n", brd_full);
+    printf("tmp_dir=%s\n",     tmp_dir);
+    printf("brd_stem=%s\n",    brd_stem);
+    printf("glb_dir=%s\n",     glb_dir);
+  }
+
+  // ── Eagle-команды: экспорт текстур ───────────────────────────────────────
+  string dpi_str;
+  sprintf(dpi_str, "%d", dpi);
+
+  string cmd;
+  cmd  = "EDIT .sch;\n";
+  cmd += "VARIANT '';\n";
+  cmd += "edit .brd;\n";
+  cmd += "ratsnest;\n";
+  cmd += "set Option.SignalNamesOnPads 0;\n";
+  cmd += "set Option.SignalNamesOnTraces 0;\n";
+  cmd += "set Option.ViaLength 0;\n";
+  cmd += "set PAD_NAMES OFF;\n";
+  cmd += "SET FILL_LAYER 29 1;\n";
+  cmd += "SET FILL_LAYER 30 1;\n";
+
+  cmd += "display none;\ndisplay 20;\ndisplay 46;\n";
+  cmd += "EXPORT IMAGE '" + textures_dir + "outline.png' MONOCHROME " + dpi_str + ";\n";
+  cmd += "display none;\ndisplay 1 17 18;\n";
+  cmd += "EXPORT IMAGE '" + textures_dir + "top_copper.png' MONOCHROME " + dpi_str + ";\n";
+  cmd += "display none;\ndisplay 21;\n";
+  cmd += "EXPORT IMAGE '" + textures_dir + "top_silk.png' MONOCHROME " + dpi_str + ";\n";
+  cmd += "display none;\ndisplay 16 17 18;\n";
+  cmd += "EXPORT IMAGE '" + textures_dir + "bottom_copper.png' MONOCHROME " + dpi_str + ";\n";
+  cmd += "display none;\ndisplay 22;\n";
+  cmd += "EXPORT IMAGE '" + textures_dir + "bottom_silk.png' MONOCHROME " + dpi_str + ";\n";
+  cmd += "display none;\ndisplay 29;\n";
+  cmd += "EXPORT IMAGE '" + textures_dir + "top_mask.png' MONOCHROME " + dpi_str + ";\n";
+  cmd += "display none;\ndisplay 30;\n";
+  cmd += "EXPORT IMAGE '" + textures_dir + "bottom_mask.png' MONOCHROME " + dpi_str + ";\n";
+  cmd += "display none;\ndisplay 17;\n";
+  cmd += "EXPORT IMAGE '" + textures_dir + "pads.png' MONOCHROME " + dpi_str + ";\n";
+
+  cmd += "display none;\n";
+  cmd += "set Option.SignalNamesOnPads 1;\n";
+  cmd += "set Option.SignalNamesOnTraces 1;\n";
+  cmd += "set PAD_NAMES ON;\n";
+  cmd += "display 20 17 18 1 21 23 25;\n";
+
+  // ── RUN step2 ─────────────────────────────────────────────────────────────
+  string step2_path = exe_dir;
+  int ci;
+  for (ci = 0; step2_path[ci]; ci++)
+    if (step2_path[ci] == '\\') step2_path[ci] = '/';
+  int slen = strlen(step2_path);
+  if (slen > 0 && step2_path[slen-1] != '/')
+    step2_path += "/";
+  step2_path += "export3D_step2.ulp";
+
+  cmd += "RUN '" + step2_path + "' '" + ini_path + "';\n";
+
+  exit(cmd);
+}

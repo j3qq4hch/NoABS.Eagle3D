@@ -1,0 +1,126 @@
+#usage "Launch eagle2gltf.py after textures exported (step 2 of 2)"
+
+string read_ini_value(string ini_path, string key)
+{
+  string lines[];
+  int n = fileread(lines, ini_path);
+  int klen = strlen(key);
+  string result = "";
+  int i;
+  for (i = 0; i < n; i++)
+  {
+    if (strsub(lines[i], 0, klen + 1) == key + "=")
+    {
+      result = strsub(lines[i], klen + 1);
+      int rlen = strlen(result);
+      if (rlen > 0 && result[rlen-1] == '\n') { result[rlen-1] = '\0'; rlen--; }
+      if (rlen > 0 && result[rlen-1] == '\r') { result[rlen-1] = '\0'; }
+    }
+  }
+  return result;
+}
+
+string win_path(string s)
+{
+  string result = s;
+  int i;
+  for (i = 0; result[i]; i++)
+    if (result[i] == '/') result[i] = '\\';
+  return result;
+}
+
+void main()
+{
+  // argv[1] = ini_path (with forward slashes, passed from step1)
+  if (argc < 2)
+  {
+    dlgMessageBox("export3d_step2: missing ini file path.\nargc=" + argc);
+    exit(1);
+  }
+
+  string ini_path = argv[1];
+
+  // Log step2 startup immediately so we know it ran
+  // ini_path has forward slashes — derive tmp_dir from it
+  // ini is at tmp_dir/export3d.ini  → tmp_dir = dirname(ini_path)
+  string tmp_dir = "";
+  int last_slash = -1;
+  int ci;
+  for (ci = 0; ini_path[ci]; ci++)
+    if (ini_path[ci] == '/' || ini_path[ci] == '\\') last_slash = ci;
+  if (last_slash >= 0)
+    tmp_dir = strsub(ini_path, 0, last_slash + 1);
+  else
+    tmp_dir = "./";
+
+  string log2_path = win_path(tmp_dir + "step2.log");
+
+  // Read ini
+  string python_exe  = read_ini_value(ini_path, "python_exe");
+  string scripts_dir = read_ini_value(ini_path, "scripts_dir");
+  string brd_full    = read_ini_value(ini_path, "brd_full");
+  string brd_stem    = read_ini_value(ini_path, "brd_stem");
+  string glb_dir     = read_ini_value(ini_path, "glb_dir");
+  string tex_dir     = win_path(tmp_dir + brd_stem + "_textures");
+
+  // Write step2.log with all parameters for debugging
+  output(log2_path, "wt")
+  {
+    printf("argc        = %d\n", argc);
+    printf("argv[1]     = %s\n", argv[1]);
+    printf("ini_path    = %s\n", ini_path);
+    printf("tmp_dir     = %s\n", tmp_dir);
+    printf("python_exe  = %s\n", python_exe);
+    printf("scripts_dir = %s\n", scripts_dir);
+    printf("brd_full    = %s\n", brd_full);
+    printf("brd_stem    = %s\n", brd_stem);
+    printf("glb_dir     = %s\n", glb_dir);
+    printf("tex_dir     = %s\n", tex_dir);
+  }
+
+  // Strip trailing slash from scripts_dir before appending filename
+  string sd = scripts_dir;
+  int sdlen = strlen(sd);
+  if (sdlen > 0 && (sd[sdlen-1] == '/' || sd[sdlen-1] == '\\'))
+    sd[sdlen-1] = '\0';
+  string script_path = win_path(sd + "\\eagle2gltf.py");
+  string log_py_path = win_path(tmp_dir + "eagle2gltf.log");
+
+  string py_cmd;
+  py_cmd  = "\"" + python_exe + "\"";
+  py_cmd += " \"" + script_path + "\"";
+  py_cmd += " \"" + win_path(brd_full) + "\"";
+  py_cmd += " --textures \"" + tex_dir + "\"";
+  py_cmd += " --log \"" + log_py_path + "\"";
+  if (strlen(glb_dir) > 0)
+    py_cmd += " -c \"" + win_path(glb_dir) + "\"";
+
+  // Write .bat file and run it — more reliable than system() with PATH issues
+  string bat_path = win_path(tmp_dir + "run_eagle2gltf.bat");
+  output(bat_path, "wt")
+  {
+    printf("@echo off\r\n");
+    printf("%s\r\n", py_cmd);
+    printf("echo EXIT_CODE=%%errorlevel%% >> \"" + win_path(log2_path) + "\"\r\n");
+  }
+
+  // Append command to step2.log
+  output(log2_path, "at")
+  {
+    printf("\ncommand:\n%s\n", py_cmd);
+    printf("bat: %s\n", bat_path);
+  }
+
+  int ret = system("cmd.exe /c \"" + bat_path + "\"");
+
+  // Append result to step2.log
+  output(log2_path, "at")
+  {
+    printf("\nsystem() exit code: %d\n", ret);
+  }
+
+  if (ret != 0)
+    dlgMessageBox("3D export FAILED.\nSee logs in NoABS_tmp/:\n  step2.log\n  eagle2gltf.log");
+  else
+    dlgMessageBox("3D export complete!\n");
+}
