@@ -1,4 +1,16 @@
-#usage "Export board textures and generate 3D GLB model.\nUsage: RUN export3d.ulp [CLEAN]"
+#usage "Export board textures and generate 3D GLB model.\n\
+Usage:\n\
+  RUN export3D_raw.ulp                                  -- interactive (dialog / saved settings)\n\
+  RUN export3D_raw.ulp CLEAN                            -- remove NoABS_tmp folder\n\
+  RUN export3D_raw.ulp '<dpi>'                          -- CLI: DPI only, other settings from ini\n\
+  RUN export3D_raw.ulp '<glb_dir>' '<dpi>'              -- CLI: glb_dir + DPI, min_priority from ini\n\
+  RUN export3D_raw.ulp '<glb_dir>' '<dpi>' '<minpri>'   -- CLI: all three explicit\n\
+    glb_dir : path to GLB components folder, or empty string '' for no components\n\
+    dpi     : export image DPI (e.g. 400)\n\
+    minpri  : minimum Priority3d to include (0 = all, default 0)\n\
+CLI via eaglecon (exports textures, generates GLB, closes Eagle without saving):\n\
+  eaglecon.exe -C \"run export3D_raw.ulp 'C:/libs/glb' '400' '1'; UNDO; QUIT\" board.brd\n\
+Note: UNDO reverts ratsnest fill so the board is not marked as modified before QUIT."
 
 string win_path(string s)
 {
@@ -31,28 +43,20 @@ string read_ini_value(string ini_path, string key)
 
 void main()
 {
-  // ── Проверяем аргумент CLEAN ─────────────────────────────────────────────
-  if (argc >= 2 && argv[1] == "CLEAN")
+  // ── CLEAN режим ──────────────────────────────────────────────────────────────
+  if (argc >= 2 && strupr(argv[1]) == "CLEAN")
   {
-    if (!board)
-    {
-      dlgMessageBox("Error: no .brd file is open.");
-      exit(1);
-    }
+    if (!board) { dlgMessageBox("Error: no .brd file is open."); exit(1); }
     string bd, tmp;
     board(B) { bd = filedir(B.name); tmp = bd + "NoABS_tmp/"; }
     system("cmd.exe /c rmdir /s /q \"" + win_path(tmp) + "\" 2>nul");
-    dlgMessageBox("NoABS_tmp cleaned (including settings):\n" + tmp);
+    dlgMessageBox("NoABS_tmp cleaned:\n" + tmp);
     exit(0);
   }
 
-  if (!board)
-  {
-    dlgMessageBox("Error: no .brd file is open.");
-    exit(1);
-  }
+  if (!board) { dlgMessageBox("Error: no .brd file is open."); exit(1); }
 
-  // ── Определяем пути ───────────────────────────────────────────────────────
+  // ── Пути из открытой платы ───────────────────────────────────────────────────
   string board_dir, brd_stem, brd_full, tmp_dir, textures_dir;
   board(B)
   {
@@ -63,120 +67,147 @@ void main()
     textures_dir = tmp_dir + brd_stem + "_textures/";
   }
 
-  // Путь к settings.ini — в папке NoABS_tmp рядом с BRD
+  // scripts_dir — всегда папка самого ULP
+  string scripts_dir = filedir(argv[0]);
+
   string settings_ini = tmp_dir + "export3d_settings.ini";
 
-  // ── Настройки: значения по умолчанию ─────────────────────────────────────
-  int    dpi         = 400;
-  string python_exe  = "python";
-  string scripts_dir = filedir(argv[0]);
-  string glb_dir     = "";
+  // ── Значения по умолчанию ────────────────────────────────────────────────────
+  int    dpi          = 400;
+  string glb_dir      = "";
+  int    min_priority = 0;
 
-  // Загружаем сохранённые настройки если есть
-  if (filesize(settings_ini) > 0)
+  // ── Определяем режим запуска ─────────────────────────────────────────────────
+  //   argc == 1       → интерактивный (ini или диалог)
+  //   argc == 2       → CLI: DPI, остальное из ini
+  //   argc == 3       → CLI: glb_dir + DPI, min_priority из ini
+  //   argc >= 4       → CLI: glb_dir + DPI + min_priority, всё явно
+
+  int cli_mode = (argc >= 2);
+
+  if (argc >= 4)
   {
-    string dpi_str = read_ini_value(settings_ini, "dpi");
-    if (strlen(dpi_str) > 0) dpi = strtol(dpi_str);
-    string pe = read_ini_value(settings_ini, "python_exe");
-    if (strlen(pe) > 0) python_exe = pe;
-    string sd = read_ini_value(settings_ini, "scripts_dir");
-    if (strlen(sd) > 0) scripts_dir = sd;
-    string gd = read_ini_value(settings_ini, "glb_dir");
-    glb_dir = gd;  // может быть пустым — это нормально
+    glb_dir      = argv[1];
+    dpi          = strtol(argv[2]);
+    min_priority = strtol(argv[3]);
   }
-
-  // ── Создаём NoABS_tmp заранее, чтобы можно было записать settings.ini ──────
-  system("cmd.exe /c mkdir \"" + win_path(tmp_dir) + "\" 2>nul");
-
-  // ── Диалог (показываем только если нет сохранённых настроек или нужна правка)
-  int show_dialog = (filesize(settings_ini) <= 0);
-
-  // Если настройки есть — сразу запускаем без диалога
-  // Если нет — показываем диалог для первоначальной настройки
-  if (show_dialog)
+  else if (argc == 3)
   {
-    if (dlgDialog("Export 3D — Initial Setup")
+    glb_dir = argv[1];
+    dpi     = strtol(argv[2]);
+    if (filesize(settings_ini) > 0)
     {
-      dlgLabel("Settings will be saved and reused on next run.");
-      dlgGroup("Image export")
-      {
-        dlgHBoxLayout
-        {
-          dlgLabel("DPI:");
-          dlgIntEdit(dpi, 1, 9999);
-          dlgStretch(1);
-        }
-      }
-      dlgGroup("Python")
-      {
-        dlgHBoxLayout { dlgLabel("Executable:"); dlgStringEdit(python_exe); }
-        dlgHBoxLayout
-        {
-          dlgLabel("Scripts dir:");
-          dlgStringEdit(scripts_dir);
-          dlgPushButton("...") scripts_dir = dlgDirectory("Select scripts directory", scripts_dir);
-        }
-      }
-      dlgGroup("Components (optional)")
-      {
-        dlgHBoxLayout
-        {
-          dlgLabel("GLB dir:");
-          dlgStringEdit(glb_dir);
-          dlgPushButton("...") glb_dir = dlgDirectory("Select GLB components directory", glb_dir);
-        }
-      }
-      dlgHBoxLayout
-      {
-        dlgPushButton("+OK")     dlgAccept();
-        dlgPushButton("-Cancel") dlgReject();
-      }
-    } != 1)
-      exit(0);
+      string mp_str = read_ini_value(settings_ini, "min_priority");
+      if (strlen(mp_str) > 0) min_priority = strtol(mp_str);
+    }
+  }
+  else if (argc == 2)
+  {
+    dpi = strtol(argv[1]);
+    if (filesize(settings_ini) > 0)
+    {
+      string gd = read_ini_value(settings_ini, "glb_dir");
+      glb_dir = gd;
+      string mp_str = read_ini_value(settings_ini, "min_priority");
+      if (strlen(mp_str) > 0) min_priority = strtol(mp_str);
+    }
+  }
+  else
+  {
+    // Интерактивный режим: сначала загружаем сохранённые настройки
+    if (filesize(settings_ini) > 0)
+    {
+      string dpi_str = read_ini_value(settings_ini, "dpi");
+      if (strlen(dpi_str) > 0) dpi = strtol(dpi_str);
+      string gd = read_ini_value(settings_ini, "glb_dir");
+      glb_dir = gd;
+      string mp_str = read_ini_value(settings_ini, "min_priority");
+      if (strlen(mp_str) > 0) min_priority = strtol(mp_str);
+    }
 
-    // Сохраняем настройки
-    string dpi_save;
-    sprintf(dpi_save, "%d", dpi);
-    output(settings_ini, "wt")
+    // Показываем диалог только при первом запуске (нет ini)
+    if (filesize(settings_ini) <= 0)
     {
-      printf("dpi=%s\n",         dpi_save);
-      printf("python_exe=%s\n",  python_exe);
-      printf("scripts_dir=%s\n", scripts_dir);
-      printf("glb_dir=%s\n",     glb_dir);
+      system("cmd.exe /c mkdir \"" + win_path(tmp_dir) + "\" 2>nul");
+
+      if (dlgDialog("Export 3D — Initial Setup")
+      {
+        dlgLabel("Settings will be saved and reused on next run.");
+        dlgGroup("Image export")
+        {
+          dlgHBoxLayout
+          {
+            dlgLabel("DPI:");
+            dlgIntEdit(dpi, 1, 9999);
+            dlgStretch(1);
+          }
+        }
+        dlgGroup("Components (optional)")
+        {
+          dlgHBoxLayout
+          {
+            dlgLabel("GLB dir:");
+            dlgStringEdit(glb_dir);
+            dlgPushButton("...") glb_dir = dlgDirectory("Select GLB components directory", glb_dir);
+          }
+          dlgHBoxLayout
+          {
+            dlgLabel("Min Priority3d:");
+            dlgIntEdit(min_priority, 0, 9999);
+            dlgStretch(1);
+          }
+        }
+        dlgHBoxLayout
+        {
+          dlgPushButton("+OK")     dlgAccept();
+          dlgPushButton("-Cancel") dlgReject();
+        }
+      } != 1)
+        exit(0);
+
+      // Сохраняем настройки
+      string dpi_save; sprintf(dpi_save, "%d", dpi);
+      string mp_save;  sprintf(mp_save,  "%d", min_priority);
+      output(settings_ini, "wt")
+      {
+        printf("dpi=%s\n",          dpi_save);
+        printf("glb_dir=%s\n",      glb_dir);
+        printf("min_priority=%s\n", mp_save);
+      }
     }
   }
 
-  // ── Создаём папку текстур ────────────────────────────────────────────────
+  // ── Создаём рабочие папки ─────────────────────────────────────────────────────
+  system("cmd.exe /c mkdir \"" + win_path(tmp_dir) + "\" 2>nul");
   system("cmd.exe /c mkdir \"" + win_path(textures_dir) + "\" 2>nul");
   system("cmd.exe /c del /f /q \"" + win_path(textures_dir) + "*.png\"");
 
-  // ── step1.log ────────────────────────────────────────────────────────────
+  // ── step1.log ─────────────────────────────────────────────────────────────────
   output(win_path(tmp_dir + "step1.log"), "wt")
   {
-    printf("board_dir   = %s\n", board_dir);
-    printf("brd_stem    = %s\n", brd_stem);
-    printf("brd_full    = %s\n", brd_full);
-    printf("tmp_dir     = %s\n", tmp_dir);
-    printf("textures_dir= %s\n", textures_dir);
-    printf("scripts_dir = %s\n", scripts_dir);
-    printf("python_exe  = %s\n", python_exe);
-    printf("glb_dir     = %s\n", glb_dir);
-    printf("settings_ini= %s\n", settings_ini);
+    printf("board_dir    = %s\n", board_dir);
+    printf("brd_stem     = %s\n", brd_stem);
+    printf("brd_full     = %s\n", brd_full);
+    printf("tmp_dir      = %s\n", tmp_dir);
+    printf("textures_dir = %s\n", textures_dir);
+    printf("scripts_dir  = %s\n", scripts_dir);
+    printf("glb_dir      = %s\n", glb_dir);
+    printf("min_priority = %d\n", min_priority);
+    printf("cli_mode     = %d\n", cli_mode);
   }
 
-  // ── ini для step2 ────────────────────────────────────────────────────────
+  // ── ini для step2 ─────────────────────────────────────────────────────────────
   string ini_path = tmp_dir + "export3d.ini";
   output(ini_path, "wt")
   {
-    printf("python_exe=%s\n",  python_exe);
-    printf("scripts_dir=%s\n", scripts_dir);
-    printf("brd_full=%s\n",    brd_full);
-    printf("tmp_dir=%s\n",     tmp_dir);
-    printf("brd_stem=%s\n",    brd_stem);
-    printf("glb_dir=%s\n",     glb_dir);
+    printf("brd_full=%s\n",      brd_full);
+    printf("tmp_dir=%s\n",       tmp_dir);
+    printf("brd_stem=%s\n",      brd_stem);
+    printf("glb_dir=%s\n",       glb_dir);
+    printf("min_priority=%d\n",  min_priority);
   }
 
-  // ── Eagle-команды: экспорт текстур ───────────────────────────────────────
+  // ── Eagle-команды: экспорт текстур ───────────────────────────────────────────
   string dpi_str;
   sprintf(dpi_str, "%d", dpi);
 
@@ -185,8 +216,11 @@ void main()
   cmd += "VARIANT '';\n";
   cmd += "edit .brd;\n";
   cmd += "ratsnest;\n";
-  cmd += "set Option.SignalNamesOnPads 0;\n";
-  cmd += "set Option.SignalNamesOnTraces 0;\n";
+  if (EAGLE_VERSION >= 9)
+  {
+    cmd += "set Option.SignalNamesOnPads 0;\n";
+    cmd += "set Option.SignalNamesOnTraces 0;\n";
+  }
   cmd += "set Option.ViaLength 0;\n";
   cmd += "set PAD_NAMES OFF;\n";
   cmd += "SET FILL_LAYER 29 1;\n";
@@ -210,22 +244,27 @@ void main()
   cmd += "EXPORT IMAGE '" + textures_dir + "pads.png' MONOCHROME " + dpi_str + ";\n";
 
   cmd += "display none;\n";
-  cmd += "set Option.SignalNamesOnPads 1;\n";
-  cmd += "set Option.SignalNamesOnTraces 1;\n";
+  if (EAGLE_VERSION >= 9)
+  {
+    cmd += "set Option.SignalNamesOnPads 1;\n";
+    cmd += "set Option.SignalNamesOnTraces 1;\n";
+  }
   cmd += "set PAD_NAMES ON;\n";
   cmd += "display 20 17 18 1 21 23 25;\n";
 
-  // ── RUN step2 ─────────────────────────────────────────────────────────────
+  // ── Запускаем step2 ───────────────────────────────────────────────────────────
   string step2_path = scripts_dir;
+  int slen = strlen(step2_path);
+  if (slen > 0 && step2_path[slen-1] != '/' && step2_path[slen-1] != '\\')
+    step2_path += "/";
   int ci;
   for (ci = 0; step2_path[ci]; ci++)
     if (step2_path[ci] == '\\') step2_path[ci] = '/';
-  int slen = strlen(step2_path);
-  if (slen > 0 && step2_path[slen-1] != '/')
-    step2_path += "/";
-  step2_path += "export3d_step2.ulp";
+  step2_path += "export3D_raw_step2.ulp";
 
-  cmd += "RUN '" + step2_path + "' '" + ini_path + "';\n";
+  string cli_flag; sprintf(cli_flag, "%d", cli_mode);
+  cmd += "RUN '" + step2_path + "' '" + ini_path + "' '" + cli_flag + "';\n";
+
 
   exit(cmd);
 }

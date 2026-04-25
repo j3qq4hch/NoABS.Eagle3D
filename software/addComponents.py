@@ -98,14 +98,23 @@ def read_brd(brd_path: Path):
     placements = []
     for el in root.iter("element"):
         angle, mirror = _parse_rot(el.get("rot", ""))
+        priority = 0
+        for attr in el.findall("attribute"):
+            if attr.get("name", "").lower() == "priority3d":
+                try:
+                    priority = int(attr.get("value", "0"))
+                except (ValueError, TypeError):
+                    pass  # нечисловое значение — игнорируем, оставляем 0
+                break
         placements.append({
-            "name":    el.get("name", ""),
-            "library": el.get("library", ""),
-            "package": el.get("package", ""),
-            "x":       float(el.get("x", 0)),
-            "y":       float(el.get("y", 0)),
-            "angle":   angle,
-            "mirror":  mirror,
+            "name":     el.get("name", ""),
+            "library":  el.get("library", ""),
+            "package":  el.get("package", ""),
+            "x":        float(el.get("x", 0)),
+            "y":        float(el.get("y", 0)),
+            "angle":    angle,
+            "mirror":   mirror,
+            "priority": priority,
         })
 
     log.info("Элементов в BRD: %d", len(placements))
@@ -241,7 +250,7 @@ def compute_placement_matrix(placement: dict, orientation: dict,
     if p["mirror"]:
         M_eagle = _mat4_mul(
             _trans(p["x"] * _MM_TO_M, p["y"] * _MM_TO_M, 0.0),
-            _mat4_mul(_rot_z(p["angle"]), _mat4_mul(_mirror_xz(), M_orient))
+            _mat4_mul(_rot_z(-p["angle"]), _mat4_mul(_mirror_xz(), M_orient))
         )
     else:
         M_eagle = _mat4_mul(
@@ -306,12 +315,21 @@ def _ensure_list(gltf: dict, key: str) -> list:
 
 
 def embed_components(board_glb_path: Path, placements: list, orientations: dict,
-                     glb_index: dict, board_thickness: float, output_path: Path):
+                     glb_index: dict, board_thickness: float, output_path: Path,
+                     min_priority: int = 0):
     """
     Встраивает компоненты в GLB платы.
     Компоненты добавляются как дочерние узлы корневого узла платы,
     чтобы наследовать его scale/rotation (мм → метры, ориентация).
+
+    min_priority — минимальный Priority3d для включения компонента в модель.
     """
+    if min_priority > 0:
+        before = len(placements)
+        placements = [p for p in placements if p["priority"] >= min_priority]
+        log.info("Фильтр по Priority3d >= %d: %d из %d компонентов",
+                 min_priority, len(placements), before)
+
     log.info("Читаем GLB платы: %s", board_glb_path)
     board_data = board_glb_path.read_bytes()
     gltf, bin_raw = parse_glb(board_data)

@@ -23,7 +23,7 @@ import array as _arr
 import logging
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageDraw, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageStat
 from _earcut import earcut as _earcut
 
 
@@ -48,6 +48,12 @@ def setup_logging():
 
 DEFAULT_LAYER     = "20"
 DEFAULT_THICKNESS = 1.6
+DEFAULT_COLORS = {
+    "substratecolor":  (120, 110,  70, 255),  # #786e46
+    "coppercolor":     (192, 192, 192, 255),  # #c0c0c0
+    "silkscreencolor": (255, 255, 255, 255),  # #ffffff
+    "soldermaskcolor": (  0, 140,  74, 255),  # #008C4A
+}
 ARC_SEGMENTS      = 64
 
 _TEX_REQUIRED = [
@@ -159,6 +165,27 @@ def parse_color(hex_str):
     return ((val >> 16) & 0xFF, (val >> 8) & 0xFF, val & 0xFF, (val >> 24) & 0xFF)
 
 
+_RE_DESCRIPTION_COLORS = re.compile(
+    r'\b(substratecolor|coppercolor|silkscreencolor|soldermaskcolor)\s*=\s*(0x[0-9A-Fa-f]+)',
+    re.IGNORECASE,
+)
+
+
+def _get_description_colors(root) -> dict:
+    """Читает цвета из текста <description> в формате 'name = 0xAARRGGBB, ...'."""
+    for desc in root.iter("description"):
+        text = desc.text or ""
+        colors = {}
+        for m in _RE_DESCRIPTION_COLORS.finditer(text):
+            try:
+                colors[m.group(1).lower()] = parse_color(m.group(2))
+            except ValueError:
+                pass
+        if colors:
+            return colors
+    return {}
+
+
 def load_brd(brd_path, layer=DEFAULT_LAYER):
     log.debug("Парсим BRD: %s", brd_path)
     tree = ET.parse(brd_path)
@@ -240,34 +267,38 @@ def get_thickness(root):
         return None
 
 
-def get_colors(root):
-    colors = {}
+def get_colors(root) -> dict:
+    """
+    Читает цвета из BRD. Приоритет: description > mfgpreviewcolor.
+    Возвращает dict {name: (R,G,B,A)}.
+    """
+    mfg_colors = {}
     for el in root.iter("mfgpreviewcolor"):
         name = el.get("name")
         color = el.get("color")
         if name and color:
-            colors[name] = parse_color(color)
-    return colors
+            try:
+                mfg_colors[name] = parse_color(color)
+            except ValueError:
+                pass
+    return {**mfg_colors, **_get_description_colors(root)}
 
 
 # ══════════════════════════════════════════════
 #  Обработка текстур (PIL-only, без numpy/scipy)
 # ══════════════════════════════════════════════
 
-def _tex_parse_color(hex_str: str):
-    clean = hex_str.strip().lstrip("0x").lstrip("0X")
-    val = int(clean, 16)
-    return ((val >> 16) & 0xFF, (val >> 8) & 0xFF, val & 0xFF, (val >> 24) & 0xFF)
+# Целевой размер изображения при floodfill — PIL floodfill реализован на Python,
+# поэтому на больших изображениях его выполняют на уменьшенной копии.
+_FILL_MIN_PX = 600
 
+# LUT-таблицы для point() — намного быстрее lambda, т.к. применяются на C уровне
+_LUT_LE128 = bytes(255 if i <= 128 else 0 for i in range(256))
+_LUT_GT128 = bytes(255 if i > 128 else 0 for i in range(256))
+_LUT_EQ128 = bytes(255 if i == 128 else 0 for i in range(256))
+_LUT_EQ255 = bytes(255 if i == 255 else 0 for i in range(256))
+_LUT_NE128 = bytes(255 if i != 128 else 0 for i in range(256))
 
-def _tex_read_colors(root) -> dict:
-    colors = {}
-    for el in root.iter("mfgpreviewcolor"):
-        name = el.get("name")
-        color = el.get("color")
-        if name and color:
-            colors[name] = _tex_parse_color(color)
-    return colors
 
 
 def _find_components_pil(mask_img: Image.Image):
@@ -278,34 +309,21 @@ def _find_components_pil(mask_img: Image.Image):
     w, h = mask_img.size
     work = mask_img.copy()
     components = []
+    lut_128 = bytes(255 if i == 128 else 0 for i in range(256))
 
     while True:
-        pix = work.load()
-        seed = None
-        for y in range(h):
-            for x in range(w):
-                if pix[x, y] == 255:
-                    seed = (x, y)
-                    break
-            if seed:
-                break
-        if seed is None:
+        raw = work.tobytes()
+        idx = raw.find(b'\xff')
+        if idx == -1:
             break
+        seed = (idx % w, idx // w)
 
         filled = work.copy()
         ImageDraw.floodfill(filled, seed, 128)
 
-        comp = Image.new("L", (w, h), 0)
-        fp = filled.load()
-        wp = work.load()
-        cp = comp.load()
-        count = 0
-        for y in range(h):
-            for x in range(w):
-                if fp[x, y] == 128 and wp[x, y] == 255:
-                    cp[x, y] = 255
-                    wp[x, y] = 0
-                    count += 1
+        comp = filled.point(lut_128)
+        count = int(ImageStat.Stat(comp).sum[0]) // 255
+        work = ImageChops.subtract(work, comp)
 
         components.append((count, comp))
 
@@ -320,44 +338,59 @@ def _tex_analyze_outline(outline_path: Path, threshold: int = 128):
       hole_mask   — interior вырезов внутри платы
       full_board  — всё что не снаружи (для bbox)
       h, w        — размеры изображения
+
+    Floodfill выполняется на уменьшенной копии (до _FILL_MIN_PX px),
+    маски увеличиваются обратно через NEAREST — даёт 10-50x ускорение
+    на высоких DPI без заметного влияния на качество.
     """
     img = Image.open(outline_path).convert("L")
     w, h = img.size
 
-    # 255 = тёмный пиксель (линия/заливка)
-    is_black = img.point(lambda x: 255 if x <= threshold else 0)
+    scale = max(1, max(w, h) // _FILL_MIN_PX)
+    sw, sh = (max(w // scale, 1), max(h // scale, 1)) if scale > 1 else (w, h)
 
-    # Pad чёрными пикселями → связываем внешнюю рамку с контуром
-    padded = Image.new("L", (w + 2, h + 2), 255)
+    lut_black = bytes(255 if i <= threshold else 0 for i in range(256))
+    is_black_full = img.point(lut_black)
+    if scale > 1:
+        dilated = is_black_full
+        for _ in range(scale):
+            dilated = dilated.filter(ImageFilter.MaxFilter(3))
+        is_black = dilated.resize((sw, sh), Image.NEAREST)
+        # Обнуляем рамку: расширенный контур может дойти до края и соединиться
+        # с белой рамкой padded, что сломало бы floodfill
+        ImageDraw.Draw(is_black).rectangle([(0, 0), (sw - 1, sh - 1)], outline=0, width=1)
+    else:
+        is_black = is_black_full
+
+    padded = Image.new("L", (sw + 2, sh + 2), 255)
     padded.paste(is_black, (1, 1))
-
-    # Заливаем снаружи значением 128 — помечаем внешнее чёрное
     ImageDraw.floodfill(padded, (0, 0), 128)
+    inner = padded.crop((1, 1, sw + 1, sh + 1))
 
-    inner = padded.crop((1, 1, w + 1, h + 1))
+    interior   = inner.point(_LUT_EQ255)
+    full_board = inner.point(_LUT_NE128)
 
-    # outside = было чёрным и связано с границей
-    outside_mask = inner.point(lambda x: 255 if x == 128 else 0)
-    # interior = всё ещё чёрное → не связано с границей
-    interior = inner.point(lambda x: 255 if x == 255 else 0)
-    # full_board = всё что не снаружи
-    full_board = inner.point(lambda x: 255 if x != 128 else 0)
-
-    empty = Image.new("L", (w, h), 0)
+    empty = Image.new("L", (sw, sh), 0)
 
     if interior.getbbox() is None:
-        return empty, empty, full_board, h, w
-
-    components = _find_components_pil(interior)
-
-    if len(components) == 1:
-        board_mask = components[0][1]
-        hole_mask  = empty
+        board_mask, hole_mask = empty, empty
     else:
-        board_mask = components[0][1]
-        hole_mask  = empty.copy()
-        for _, comp in components[1:]:
-            hole_mask = ImageChops.add(hole_mask, comp).point(lambda x: min(x, 255))
+        components = _find_components_pil(interior)
+        if not components:
+            board_mask, hole_mask = empty, empty
+        elif len(components) == 1:
+            board_mask = components[0][1]
+            hole_mask  = empty
+        else:
+            board_mask = components[0][1]
+            hole_mask  = empty.copy()
+            for _, comp in components[1:]:
+                hole_mask = ImageChops.add(hole_mask, comp)
+
+    if scale > 1:
+        board_mask = board_mask.resize((w, h), Image.NEAREST)
+        hole_mask  = hole_mask.resize((w, h), Image.NEAREST)
+        full_board = full_board.resize((w, h), Image.NEAREST)
 
     return board_mask, hole_mask, full_board, h, w
 
@@ -399,14 +432,29 @@ def _tex_composite(base: Image.Image, overlay: Image.Image) -> Image.Image:
 def _tex_extract_drill_holes(pads_gray: Image.Image) -> Image.Image:
     """Возвращает PIL L-маску drill holes (чёрные области не связанные с границей)."""
     w, h = pads_gray.size
-    is_black = pads_gray.point(lambda x: 255 if x <= 128 else 0)
 
-    padded = Image.new("L", (w + 2, h + 2), 255)
+    scale = max(1, max(w, h) // _FILL_MIN_PX)
+    sw, sh = (max(w // scale, 1), max(h // scale, 1)) if scale > 1 else (w, h)
+
+    is_black_full = pads_gray.point(_LUT_LE128)
+    if scale > 1:
+        dilated = is_black_full
+        for _ in range(scale):
+            dilated = dilated.filter(ImageFilter.MaxFilter(3))
+        is_black = dilated.resize((sw, sh), Image.NEAREST)
+        ImageDraw.Draw(is_black).rectangle([(0, 0), (sw - 1, sh - 1)], outline=0, width=1)
+    else:
+        is_black = is_black_full
+
+    padded = Image.new("L", (sw + 2, sh + 2), 255)
     padded.paste(is_black, (1, 1))
     ImageDraw.floodfill(padded, (0, 0), 128)
-    inner = padded.crop((1, 1, w + 1, h + 1))
+    inner = padded.crop((1, 1, sw + 1, sh + 1))
+    result = inner.point(_LUT_EQ255)
 
-    return inner.point(lambda x: 255 if x == 255 else 0)
+    if scale > 1:
+        result = result.resize((w, h), Image.NEAREST)
+    return result
 
 
 def read_png_dpi(path: Path):
@@ -421,21 +469,29 @@ def read_png_dpi(path: Path):
     return None
 
 
-def process_textures(brd_path: Path, tex_dir: Path, output_dir: Path) -> bool:
+def process_textures(brd_path: Path, tex_dir: Path, output_dir: Path,
+                     colors_override: dict = None) -> bool:
     """
     Обрабатывает текстуры Eagle -> texture_top.png + texture_bottom.png.
     Сохраняет результат в output_dir.
     Возвращает True при успехе.
+
+    colors_override — полностью разрешённый dict цветов (substratecolor, coppercolor,
+    silkscreencolor, soldermaskcolor) в виде (R,G,B,A) кортежей. Если передан,
+    используется вместо чтения из BRD; иначе цвета читаются из BRD с DEFAULT_COLORS как fallback.
     """
     log.info("Обрабатываем текстуры из: %s", tex_dir)
 
-    root = ET.parse(brd_path).getroot()
-    colors = _tex_read_colors(root)
+    if colors_override is not None:
+        colors = colors_override
+    else:
+        root = ET.parse(brd_path).getroot()
+        colors = {**DEFAULT_COLORS, **get_colors(root)}
 
-    substrate_color  = colors.get("substratecolor",  (120, 110, 70,  255))
-    copper_color     = colors.get("coppercolor",      (255, 191,  0,  255))
-    silkscreen_color = colors.get("silkscreencolor",  (255, 255, 255, 255))
-    soldermask_color = colors.get("soldermaskcolor",  (  0, 128,  0,  200))
+    substrate_color  = colors.get("substratecolor",  DEFAULT_COLORS["substratecolor"])
+    copper_color     = colors.get("coppercolor",      DEFAULT_COLORS["coppercolor"])
+    silkscreen_color = colors.get("silkscreencolor",  DEFAULT_COLORS["silkscreencolor"])
+    soldermask_color = colors.get("soldermaskcolor",  DEFAULT_COLORS["soldermaskcolor"])
 
     log.debug("Цвета: substrate=%s, copper=%s, soldermask=%s",
               substrate_color[:3], copper_color[:3], soldermask_color[:3])
@@ -496,7 +552,7 @@ def process_textures(brd_path: Path, tex_dir: Path, output_dir: Path) -> bool:
     bot_msk = load_r("bottom_mask.png")
 
     def thresh(img):
-        return img.point(lambda x: 255 if x > 128 else 0)
+        return img.point(_LUT_GT128)
 
     top_cu_t  = thresh(top_cu)
     bot_cu_t  = thresh(bot_cu)
@@ -631,6 +687,8 @@ def chain_to_polygon(chain, n=ARC_SEGMENTS):
             d = math.sqrt(max(r ** 2 - (chord / 2) ** 2, 0))
             px, py = -dy / chord, dx / chord
             sign = 1 if curve > 0 else -1
+            if abs(curve) > 180:
+                sign = -sign
             cx = mx + sign * d * px
             cy = my + sign * d * py
             a1 = math.degrees(math.atan2(y1 - cy, x1 - cx))
