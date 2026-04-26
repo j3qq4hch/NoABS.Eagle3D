@@ -15,6 +15,7 @@ import sys
 import shutil
 import argparse
 import logging
+import time
 from pathlib import Path
 
 # ── Импортируем building blocks из generatePCB и addComponents ──
@@ -69,6 +70,10 @@ def process(brd_path, output_path, thickness_override, layer,
     """
     brd_path    = Path(brd_path)
     output_path = Path(output_path)
+
+    t0 = time.perf_counter()
+    def ms():
+        return int((time.perf_counter() - t0) * 1000)
 
     # Промежуточные файлы — в NoABS_tmp рядом с BRD
     work_dir       = brd_path.parent / "NoABS_tmp"
@@ -128,6 +133,7 @@ def process(brd_path, output_path, thickness_override, layer,
              len(top_d[0]) // 3,  len(top_d[3])  // 3,
              len(bot_d[0]) // 3,  len(bot_d[3])  // 3,
              len(side_d[0]) // 3, len(side_d[3]) // 3)
+    log.info("[+%dms] контур + меш платы", ms())
 
     # ── Шаг 2: текстуры ──
     # По умолчанию ищем в <brd_dir>/<stem>_textures/ (оригинальное поведение eagle2gltf)
@@ -144,6 +150,7 @@ def process(brd_path, output_path, thickness_override, layer,
     tex_top = work_dir / "texture_top.png"
     tex_bot = work_dir / "texture_bottom.png"
 
+    t_tex = time.perf_counter()
     if tex_dir.exists():
         ok = process_textures(brd_path, tex_dir, work_dir, colors_override=final_colors)
         if not ok:
@@ -155,13 +162,17 @@ def process(brd_path, output_path, thickness_override, layer,
         log.warning("texture_top.png отсутствует")
     if not tex_bot.exists():
         log.warning("texture_bottom.png отсутствует")
+    log.info("[+%dms] текстуры (%dms)", ms(), int((time.perf_counter() - t_tex) * 1000))
 
     # ── Шаг 3: GLB платы (промежуточный) ──
+    t_glb = time.perf_counter()
     log.info("Собираем GLB платы...")
     build_glb(prim_data, tex_top, tex_bot, side_color, board_glb_path)
+    log.info("[+%dms] GLB платы (%dms)", ms(), int((time.perf_counter() - t_glb) * 1000))
 
     # ── Шаг 4: компоненты (если указаны) ──
     if glb_dir is not None:
+        t_comp = time.perf_counter()
         log.info("Добавляем компоненты из: %s", glb_dir)
         placements, orientations, _ = read_brd_components(brd_path)
         glb_index = build_glb_index(Path(glb_dir))
@@ -170,6 +181,7 @@ def process(brd_path, output_path, thickness_override, layer,
             glb_index, thickness, output_path,
             min_priority=min_priority,
         )
+        log.info("[+%dms] компоненты (%dms)", ms(), int((time.perf_counter() - t_comp) * 1000))
     else:
         # Без компонентов — копируем промежуточный GLB в output_path
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -177,6 +189,7 @@ def process(brd_path, output_path, thickness_override, layer,
             shutil.copy2(board_glb_path, output_path)
             log.debug("Скопирован GLB: %s -> %s", board_glb_path, output_path)
 
+    log.info("[+%dms] ИТОГО", ms())
     log.info("Готово: %s", output_path.resolve())
     print(str(output_path.resolve()))
 

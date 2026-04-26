@@ -352,13 +352,18 @@ def _tex_analyze_outline(outline_path: Path, threshold: int = 128):
     lut_black = bytes(255 if i <= threshold else 0 for i in range(256))
     is_black_full = img.point(lut_black)
     if scale > 1:
+        # Eagle exports dark background + bright outline, so is_black has 255=background, 0=outline.
+        # PIL NEAREST resize can miss a 1-px outline entirely (sample points skip it).
+        # MinFilter at full resolution thickens the outline (expands 0-pixels) before downscale,
+        # guaranteeing every NEAREST block contains at least one outline pixel.
+        # scale//2+1 passes make the outline wide enough to survive the scale-factor block size.
         dilated = is_black_full
-        for _ in range(scale):
-            dilated = dilated.filter(ImageFilter.MaxFilter(3))
+        for _ in range(scale // 2 + 1):
+            dilated = dilated.filter(ImageFilter.MinFilter(3))
         is_black = dilated.resize((sw, sh), Image.NEAREST)
-        # Обнуляем рамку: расширенный контур может дойти до края и соединиться
-        # с белой рамкой padded, что сломало бы floodfill
-        ImageDraw.Draw(is_black).rectangle([(0, 0), (sw - 1, sh - 1)], outline=0, width=1)
+        # Ensure exterior background (255) at image edges connects to padded border (also 255),
+        # even if MinFilter expansion reached the image boundary.
+        ImageDraw.Draw(is_black).rectangle([(0, 0), (sw - 1, sh - 1)], outline=255, width=1)
     else:
         is_black = is_black_full
 
@@ -439,10 +444,10 @@ def _tex_extract_drill_holes(pads_gray: Image.Image) -> Image.Image:
     is_black_full = pads_gray.point(_LUT_LE128)
     if scale > 1:
         dilated = is_black_full
-        for _ in range(scale):
-            dilated = dilated.filter(ImageFilter.MaxFilter(3))
+        for _ in range(scale // 2 + 1):
+            dilated = dilated.filter(ImageFilter.MinFilter(3))
         is_black = dilated.resize((sw, sh), Image.NEAREST)
-        ImageDraw.Draw(is_black).rectangle([(0, 0), (sw - 1, sh - 1)], outline=0, width=1)
+        ImageDraw.Draw(is_black).rectangle([(0, 0), (sw - 1, sh - 1)], outline=255, width=1)
     else:
         is_black = is_black_full
 
@@ -612,7 +617,28 @@ def _matches(ax, ay, bx, by, tol=1e-3):
     return abs(ax - bx) < tol and abs(ay - by) < tol
 
 
+def _dedup_wires(wires, tol=1e-3, curve_tol=0.5):
+    """Remove duplicate wires — same arc encoded twice (same or opposite direction)."""
+    kept = []
+    for a in wires:
+        is_dup = False
+        for b in kept:
+            same_dir = (_matches(a["x1"], a["y1"], b["x1"], b["y1"], tol) and
+                        _matches(a["x2"], a["y2"], b["x2"], b["y2"], tol) and
+                        abs(a["curve"] - b["curve"]) < curve_tol)
+            rev_dir  = (_matches(a["x1"], a["y1"], b["x2"], b["y2"], tol) and
+                        _matches(a["x2"], a["y2"], b["x1"], b["y1"], tol) and
+                        abs(a["curve"] + b["curve"]) < curve_tol)
+            if same_dir or rev_dir:
+                is_dup = True
+                break
+        if not is_dup:
+            kept.append(a)
+    return kept
+
+
 def chain_segments(wires, tol=1e-3):
+    wires = _dedup_wires(wires, tol)
     remaining = list(range(len(wires)))
     chains = []
     while remaining:

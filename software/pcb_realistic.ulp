@@ -1,0 +1,120 @@
+// pcb_realistic.ulp
+// Настраивает цвета слоёв EAGLE для реалистичного вида PCB.
+// Запускать из Board Editor: RUN pcb_realistic.ulp
+
+// ── Цвета по умолчанию (зелёная плата, ENIG) ──────────────
+int r_mask    = 20,  g_mask    = 80,  b_mask    = 30;  // паяльная маска (фон)
+int r_copper  = 15,  g_copper  = 62,  b_copper  = 22;  // медь под маской
+int r_exposed = 212, g_exposed = 175, b_exposed = 55;  // открытые пады (ENIG)
+int r_silk    = 240, g_silk    = 240, b_silk    = 240; // шелкография
+int r_fr4     = 180, g_fr4     = 140, b_fr4     = 60;  // текстолит (край платы)
+
+// ── Диалог ────────────────────────────────────────────────
+int ok = dlgDialog("Реалистичные цвета PCB") {
+
+    dlgGroup("Паяльная маска (фон платы)") {
+        dlgHBoxLayout {
+            dlgLabel("R:"); dlgIntEdit(r_mask,    0, 255);
+            dlgLabel("G:"); dlgIntEdit(g_mask,    0, 255);
+            dlgLabel("B:"); dlgIntEdit(b_mask,    0, 255);
+        }
+    }
+
+    dlgGroup("Медь под маской (трассы)") {
+        dlgHBoxLayout {
+            dlgLabel("R:"); dlgIntEdit(r_copper,  0, 255);
+            dlgLabel("G:"); dlgIntEdit(g_copper,  0, 255);
+            dlgLabel("B:"); dlgIntEdit(b_copper,  0, 255);
+        }
+    }
+
+    dlgGroup("Открытые пады (ENIG / HASL)") {
+        dlgHBoxLayout {
+            dlgLabel("R:"); dlgIntEdit(r_exposed, 0, 255);
+            dlgLabel("G:"); dlgIntEdit(g_exposed, 0, 255);
+            dlgLabel("B:"); dlgIntEdit(b_exposed, 0, 255);
+        }
+    }
+
+    dlgGroup("Шелкография") {
+        dlgHBoxLayout {
+            dlgLabel("R:"); dlgIntEdit(r_silk,    0, 255);
+            dlgLabel("G:"); dlgIntEdit(g_silk,    0, 255);
+            dlgLabel("B:"); dlgIntEdit(b_silk,    0, 255);
+        }
+    }
+
+    dlgGroup("Текстолит FR4 (контур платы)") {
+        dlgHBoxLayout {
+            dlgLabel("R:"); dlgIntEdit(r_fr4,     0, 255);
+            dlgLabel("G:"); dlgIntEdit(g_fr4,     0, 255);
+            dlgLabel("B:"); dlgIntEdit(b_fr4,     0, 255);
+        }
+    }
+
+    dlgHBoxLayout {
+        dlgPushButton("+OK")    { dlgAccept(1); }
+        dlgPushButton( "Отмена") { dlgReject(0); }
+    }
+};
+
+if (!ok) exit(0);
+
+// ── Индексы палитры, которые мы займём (16–20, не трогаем стандартные 0–15) ──
+// 16 = маска      → используется как фон
+// 17 = медь       → слои Top, Bottom
+// 18 = открытые   → слои tStop, bStop
+// 19 = шелкография→ слои tPlace, bPlace, tNames, bNames
+// 20 = FR4        → слой Dimension
+
+string cmd = "";
+
+// ── Задаём палитру ────────────────────────────────────────
+string s;
+sprintf(s, "SET PALETTE 16 %d %d %d;\n", r_mask,    g_mask,    b_mask);    cmd += s;
+sprintf(s, "SET PALETTE 17 %d %d %d;\n", r_copper,  g_copper,  b_copper);  cmd += s;
+sprintf(s, "SET PALETTE 18 %d %d %d;\n", r_exposed, g_exposed, b_exposed); cmd += s;
+sprintf(s, "SET PALETTE 19 %d %d %d;\n", r_silk,    g_silk,    b_silk);    cmd += s;
+sprintf(s, "SET PALETTE 20 %d %d %d;\n", r_fr4,     g_fr4,     b_fr4);     cmd += s;
+
+// ── Назначаем цвета слоям ────────────────────────────────
+// Синтаксис: LAYER <color_index> <fill> <number> <name>
+// fill 1 = сплошная заливка
+
+// Медь
+cmd += "LAYER 17 1 1 Top;\n";
+cmd += "LAYER 17 1 16 Bottom;\n";
+cmd += "LAYER 17 1 17 Pads;\n";
+cmd += "LAYER 17 1 18 Vias;\n";
+
+// Открытые пады (tStop/bStop рисуется ПОВЕРХ меди — это и есть "вырезы")
+cmd += "LAYER 18 1 29 tStop;\n";
+cmd += "LAYER 18 1 30 bStop;\n";
+
+// Шелкография
+cmd += "LAYER 19 1 21 tPlace;\n";
+cmd += "LAYER 19 1 22 bPlace;\n";
+cmd += "LAYER 19 1 25 tNames;\n";
+cmd += "LAYER 19 1 26 bNames;\n";
+
+// Контур платы (FR4 виден только по краю)
+cmd += "LAYER 20 1 20 Dimension;\n";
+
+// Прячем технические слои, которые не нужны для вида
+cmd += "LAYER 0 1 31 tCream;\n";
+cmd += "LAYER 0 1 32 bCream;\n";
+cmd += "LAYER 0 1 39 tKeepout;\n";
+cmd += "LAYER 0 1 40 bKeepout;\n";
+cmd += "LAYER 0 1 41 tRestrict;\n";
+cmd += "LAYER 0 1 42 bRestrict;\n";
+cmd += "LAYER 0 1 43 vRestrict;\n";
+
+// ── Показываем только нужные слои ────────────────────────
+cmd += "DISPLAY NONE;\n";
+cmd += "DISPLAY 1 16 17 18 20 21 22 25 26 29 30;\n";
+
+// ── Фон = цвет маски ─────────────────────────────────────
+cmd += "SET BACKGROUND_COLOR 16;\n";
+
+// ── Передаём команды в EAGLE ─────────────────────────────
+exit(cmd);
