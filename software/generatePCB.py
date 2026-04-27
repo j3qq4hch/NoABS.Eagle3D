@@ -88,6 +88,7 @@ def parse_rot(s):
 def transform_point(lx, ly, angle, mirror, tx, ty):
     if mirror:
         lx = -lx
+        angle = -angle
     rad = math.radians(angle)
     return (math.cos(rad) * lx - math.sin(rad) * ly + tx,
             math.sin(rad) * lx + math.cos(rad) * ly + ty)
