@@ -1,7 +1,8 @@
 #usage "Export board textures and generate 3D GLB model.\n\
 Usage:\n\
   RUN export3D.ulp       -- run silently if already configured, else show dialog\n\
-  RUN export3D.ulp SET   -- always show settings dialog"
+  RUN export3D.ulp SET   -- always show settings dialog\n\
+  RUN export3D.ulp OPEN  -- generate and open result in system viewer"
 
 string win_path(string s)
 {
@@ -39,7 +40,7 @@ void main()
   string glb_dir, dpi_str, cmd, s, v;
   string mp_save, mc_save, fc_save, sc_save, dpi_save;
   int min_priority, mask_choice, finish_choice, silk_choice, dpi;
-  int set_mode, show_dialog, slen, ci, i, p, aa, rr, gg, bb;
+  int set_mode, open_mode, show_dialog, slen, ci, i, p, aa, rr, gg, bb;
   int r_mask, g_mask, b_mask, r_cu, g_cu, b_cu;
   int r_fin, g_fin, b_fin, r_silk, g_silk, b_silk;
   int saved_pal[], saved_col[];
@@ -84,6 +85,7 @@ void main()
   dpi           = 400;
 
   set_mode    = (argc == 2 && strupr(argv[1]) == "SET");
+  open_mode   = (argc == 2 && strupr(argv[1]) == "OPEN");
   show_dialog = set_mode || (filesize(settings_ini) <= 0);
 
   // ── Load saved settings ────────────────────────────────────────────────────
@@ -236,7 +238,7 @@ void main()
   cmd += "SET COLOR_LAYER 18 17;\n";
   cmd += "SET COLOR_LAYER 19 17;\n";
   cmd += "SET COLOR_LAYER 21 18;\n";
-  cmd += "SET Option.LayerSequence 20 29 21 1 18 19;\n";
+  cmd += "SET Option.LayerSequence 20 21 29 1 18 19;\n";
   cmd += "DISPLAY NONE;\n";
   cmd += "DISPLAY 1 18 19 20 21 29;\n";
   sprintf(s, "EXPORT IMAGE '%s' %s;\n", textures_dir + "top_texture.png", dpi_str);
@@ -248,7 +250,7 @@ void main()
   cmd += "SET COLOR_LAYER 17 17;\n";
   cmd += "SET COLOR_LAYER 18 17;\n";
   cmd += "SET COLOR_LAYER 22 18;\n";
-  cmd += "SET Option.LayerSequence 20 30 22 16 17 18;\n";
+  cmd += "SET Option.LayerSequence 20 22 30 16 17 18;\n";
   cmd += "DISPLAY NONE;\n";
   cmd += "DISPLAY 16 17 18 20 22 30;\n";
   sprintf(s, "EXPORT IMAGE '%s' %s;\n", textures_dir + "bottom_texture.png", dpi_str);
@@ -290,7 +292,8 @@ void main()
     if (step2_path[ci] == '\\') step2_path[ci] = '/';
   step2_path += "export3D_raw_step2.ulp";
 
-  cmd += "RUN '" + step2_path + "' '" + ini_path + "' '0';\n";
+  string open_flag; sprintf(open_flag, "%d", open_mode);
+  cmd += "RUN '" + step2_path + "' '" + ini_path + "' '0' '" + open_flag + "';\n";
 
   exit(cmd);
 }

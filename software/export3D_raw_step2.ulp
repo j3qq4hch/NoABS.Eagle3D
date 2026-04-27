@@ -39,7 +39,8 @@ void main()
   }
 
   string ini_path = argv[1];
-  int cli_mode = (argc >= 3 && argv[2] == "1");
+  int cli_mode  = (argc >= 3 && argv[2] == "1");
+  int open_mode = (argc >= 4 && argv[3] == "1");
 
   // Log step2 startup immediately so we know it ran
   // ini_path has forward slashes — derive tmp_dir from it
@@ -105,6 +106,8 @@ void main()
     py_cmd += " -c \"" + win_path(glb_dir) + "\"";
   if (strlen(min_pri_str) > 0 && strtol(min_pri_str) > 0)
     py_cmd += " --min-priority " + min_pri_str;
+  if (open_mode)
+    py_cmd += " --open";
 
   // Write .bat file and run it — more reliable than system() with PATH issues
   string bat_path = win_path(tmp_dir + "run_eagle2gltf.bat");
@@ -130,11 +133,4 @@ void main()
     printf("\nsystem() exit code: %d\n", ret);
   }
 
-  if (!cli_mode)
-  {
-    if (ret != 0)
-      dlgMessageBox("3D export FAILED.\nSee logs in NoABS_tmp/:\n  step2.log\n  eagle2gltf.log");
-    else
-      dlgMessageBox("3D export complete!");
-  }
 }

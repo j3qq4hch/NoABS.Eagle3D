@@ -12,6 +12,7 @@ eagle2gltf1.py
 """
 
 import sys
+import os
 import shutil
 import argparse
 import logging
@@ -98,7 +99,7 @@ log = logging.getLogger("eagle2gltf1")
 
 def process(brd_path, output_path, thickness_override, layer,
             glb_dir=None, tex_dir_override=None,
-            min_priority=0):
+            min_priority=0, open_after=False):
     """
     Полный pipeline: BRD → GLB платы с текстурами и (опционально) компонентами.
 
@@ -236,6 +237,8 @@ def process(brd_path, output_path, thickness_override, layer,
     log.info("[+%dms] ИТОГО", ms())
     log.info("Готово: %s", output_path.resolve())
     print(str(output_path.resolve()))
+    if open_after:
+        os.startfile(str(output_path.resolve()))
 
 
 # ══════════════════════════════════════════════
@@ -258,6 +261,8 @@ def main():
                         help="Минимальный Priority3d компонента для включения в модель (default: 0 — все)")
     parser.add_argument("--textures", default=None,
                         help="Директория с PNG текстурами (default: <brd_stem>_textures/)")
+    parser.add_argument("--open", action="store_true", default=False,
+                        help="Открыть результат в системном просмотрщике после генерации")
     parser.add_argument("--log", default=None,
                         help="Путь к лог-файлу (default: только stdout)")
     args = parser.parse_args()
@@ -291,7 +296,7 @@ def main():
 
     try:
         process(brd_path, output, args.thickness, args.layer, glb_dir, tex_dir_override,
-                min_priority=args.min_priority)
+                min_priority=args.min_priority, open_after=args.open)
     except Exception as e:
         import traceback
         log.error("FATAL ERROR: %s\n%s", e, traceback.format_exc())
