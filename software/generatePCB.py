@@ -23,6 +23,7 @@ import argparse
 import array as _arr
 import logging
 import shutil
+import time as _time
 from collections import defaultdict
 from pathlib import Path
 
@@ -58,7 +59,8 @@ DEFAULT_COLORS = {
     "soldermaskcolor": (  0, 140,  74, 255),  # #008C4A
 }
 ARC_SEGMENTS        = 64  # arc resolution for board outer outline
-CUTOUT_ARC_SEGMENTS = 6   # arc resolution for cutout/milling polygons (fewer = faster earcut)
+CUTOUT_ARC_SEGMENTS = 16  # arc resolution for arcs within milling chains
+CIRCLE_CUTOUT_SEGMENTS = 32  # arc resolution for full-circle cutouts on layer 20
 HOLE_SEGMENTS       = 24  # arc resolution for circular drill holes
 
 _TEX_REQUIRED = [
@@ -828,32 +830,33 @@ def build_board_mesh(outer_chain, cutout_chains, layer_circles,
     idx_u32   — array.array('I') плоский: [i0,i1,i2, ...]
     """
     outer_pts    = chain_to_polygon(outer_chain)
-    cutout_polys = [chain_to_polygon(ch, n=CUTOUT_ARC_SEGMENTS) for ch in cutout_chains]
-    cutout_polys += [circle_to_polygon(c["x"], c["y"], c["radius"]) for c in layer_circles]
+    # Milling cutouts from chains — winding unknown, need ensure_cw
+    cutout_polys  = [chain_to_polygon(ch, n=CUTOUT_ARC_SEGMENTS) for ch in cutout_chains]
+    # Full circles on board outline are cutouts — use CIRCLE_CUTOUT_SEGMENTS (not CUTOUT_ARC_SEGMENTS
+    # which is intended for short arcs within chains; a full circle with 6 pts = hexagon)
+    circle_cutouts = [circle_to_polygon(c["x"], c["y"], c["radius"], n=CIRCLE_CUTOUT_SEGMENTS)
+                      for c in layer_circles]
+    # Drill/component holes — circle_to_polygon always produces CCW, no area check needed
+    hole_polys    = [circle_to_polygon(h["x"], h["y"], h["radius"], n=HOLE_SEGMENTS)
+                     for h in board_holes + comp_holes]
 
-    hole_polys = []
-    for h in board_holes + comp_holes:
-        hole_polys.append(circle_to_polygon(h["x"], h["y"], h["radius"], n=HOLE_SEGMENTS))
-
-    all_cutouts = cutout_polys + hole_polys
-
-    outer_pts   = ensure_ccw(outer_pts)
-    all_cutouts = [ensure_cw(list(h)) for h in all_cutouts]
+    outer_pts = ensure_ccw(outer_pts)
+    # Chain-based cutouts: winding unknown → compute area and conditionally reverse
+    cw_cutouts = [ensure_cw(list(h)) for h in cutout_polys]
+    # Circle-based cutouts: always CCW → reverse directly, no area computation
+    cw_circles = [h[::-1] for h in circle_cutouts]
+    cw_holes   = [h[::-1] for h in hole_polys]
+    all_cutouts = cw_cutouts + cw_circles + cw_holes
 
     all_x = [p[0] for p in outer_pts]
     all_y = [p[1] for p in outer_pts]
     xmin, xmax = min(all_x), max(all_x)
     ymin, ymax = min(all_y), max(all_y)
-    dx = xmax - xmin or 1.0
-    dy = ymax - ymin or 1.0
+    dx   = xmax - xmin or 1.0
+    dy   = ymax - ymin or 1.0
+    inv_dx = 1.0 / dx
+    inv_dy = 1.0 / dy
 
-    def uv_top(x, y):
-        return (x - xmin) / dx, 1.0 - (y - ymin) / dy
-
-    def uv_bottom(x, y):
-        return (x - xmin) / dx, 1.0 - (y - ymin) / dy
-
-    import time as _time
     _t0 = _time.monotonic()
     log.debug("Earcut: контур=%d вершин, вырезов=%d, точек в вырезах=%d",
               len(outer_pts), len(all_cutouts), sum(len(h) for h in all_cutouts))
@@ -861,59 +864,78 @@ def build_board_mesh(outer_chain, cutout_chains, layer_circles,
     log.debug("Earcut завершён за %.1f мс", (_time.monotonic() - _t0) * 1000)
     n_face = len(face_pts)
 
-    # Верхняя грань
-    top_verts = _arr.array('f', [c for p in face_pts for c in (p[0], p[1], thickness)])
-    top_norms = _arr.array('f', [c for _ in face_pts for c in (0.0, 0.0, 1.0)])
-    top_uvs   = _arr.array('f', [c for p in face_pts for c in uv_top(p[0], p[1])])
-    top_idx   = _arr.array('I', face_idx)
+    # Single pass over face_pts → top+bot verts and shared UV (uv_top == uv_bottom)
+    _t1 = _time.monotonic()
+    top_v = []; bot_v = []; uv_d = []
+    for px, py in face_pts:
+        top_v.extend((px, py, thickness))
+        bot_v.extend((px, py, 0.0))
+        uv_d.extend(((px - xmin) * inv_dx, 1.0 - (py - ymin) * inv_dy))
 
-    # Нижняя грань (нормаль -Z, обратный порядок треугольников)
-    bot_verts = _arr.array('f', [c for p in face_pts for c in (p[0], p[1], 0.0)])
-    bot_norms = _arr.array('f', [c for _ in face_pts for c in (0.0, 0.0, -1.0)])
-    bot_uvs   = _arr.array('f', [c for p in face_pts for c in uv_bottom(p[0], p[1])])
-    bot_idx   = _arr.array('I')
-    for i in range(0, len(face_idx), 3):
-        bot_idx.extend([face_idx[i], face_idx[i + 2], face_idx[i + 1]])
+    top_verts = _arr.array('f', top_v)
+    bot_verts = _arr.array('f', bot_v)
+    shared_uvs = _arr.array('f', uv_d)   # top and bottom UVs are identical
+    top_uvs = bot_uvs = shared_uvs
+
+    # Constant normals: list multiplication is O(n) at C level, no Python loop
+    top_norms = _arr.array('f', [0.0, 0.0,  1.0] * n_face)
+    bot_norms = _arr.array('f', [0.0, 0.0, -1.0] * n_face)
+
+    top_idx = _arr.array('I', face_idx)
+
+    # Bottom face: reverse winding per triangle — single list comprehension, no per-tri extend
+    fi      = face_idx
+    bot_idx = _arr.array('I', [fi[i + j] for i in range(0, len(fi), 3) for j in (0, 2, 1)])
+    log.debug("Грани top/bot построены за %.1f мс", (_time.monotonic() - _t1) * 1000)
 
     # Боковые грани
     def build_side_ring(ring_pts, facing_out):
         n = len(ring_pts)
-        ring_len = sum(
-            math.hypot(ring_pts[(i + 1) % n][0] - ring_pts[i][0],
-                       ring_pts[(i + 1) % n][1] - ring_pts[i][1])
-            for i in range(n)
-        ) or 1.0
 
-        verts   = _arr.array('f')
-        norms   = _arr.array('f')
-        uvs     = _arr.array('f')
-        indices = _arr.array('I')
-        vc      = 0
-        cum     = 0.0
+        # Precompute next-point list to avoid repeated modulo indexing
+        next_pts = ring_pts[1:] + [ring_pts[0]]
+
+        # Single pass: edge vectors and lengths (was: two passes with duplicate hypot)
+        ex_arr   = [next_pts[i][0] - ring_pts[i][0] for i in range(n)]
+        ey_arr   = [next_pts[i][1] - ring_pts[i][1] for i in range(n)]
+        seg_lens = [math.hypot(ex_arr[i], ey_arr[i]) for i in range(n)]
+        ring_len = sum(seg_lens) or 1.0
+
+        # Cumulative arc lengths for UV u-coordinates
+        cum = 0.0
+        cum_arr = []
+        for sl in seg_lens:
+            cum_arr.append(cum)
+            cum += sl
+
+        # Accumulate into plain Python lists; create arrays once at the end
+        # (array.extend per iteration is ~3x slower than a single array() call)
+        verts_d = []
+        norms_d = []
+        uvs_d   = []
+        idx_d   = []
 
         for i in range(n):
             x0, y0 = ring_pts[i]
-            x1, y1 = ring_pts[(i + 1) % n]
-            ex, ey = x1 - x0, y1 - y0
-            L = math.hypot(ex, ey) or 1.0
-            nx, ny = ey / L, -ex / L
+            x1, y1 = next_pts[i]
+            L = seg_lens[i] or 1.0
+            nx, ny = ey_arr[i] / L, -ex_arr[i] / L
             if not facing_out:
                 nx, ny = -nx, -ny
 
-            seg_len = math.hypot(ex, ey)
-            u0 = cum / ring_len
-            u1 = (cum + seg_len) / ring_len
-            cum += seg_len
+            u0 = cum_arr[i] / ring_len
+            u1 = (cum_arr[i] + seg_lens[i]) / ring_len
+            vc = i * 4
 
-            verts.extend([x0, y0, 0.0,       x0, y0, thickness,
-                          x1, y1, thickness,  x1, y1, 0.0])
-            norms.extend([nx, ny, 0.0,  nx, ny, 0.0,
-                          nx, ny, 0.0,  nx, ny, 0.0])
-            uvs.extend([u0, 0.0,  u0, 1.0,  u1, 1.0,  u1, 0.0])
-            indices.extend([vc, vc + 1, vc + 2, vc, vc + 2, vc + 3])
-            vc += 4
+            verts_d += [x0, y0, 0.0,       x0, y0, thickness,
+                        x1, y1, thickness,  x1, y1, 0.0]
+            norms_d += [nx, ny, 0.0,  nx, ny, 0.0,
+                        nx, ny, 0.0,  nx, ny, 0.0]
+            uvs_d   += [u0, 0.0,  u0, 1.0,  u1, 1.0,  u1, 0.0]
+            idx_d   += [vc, vc + 1, vc + 2, vc, vc + 2, vc + 3]
 
-        return verts, norms, uvs, indices, vc
+        return (_arr.array('f', verts_d), _arr.array('f', norms_d),
+                _arr.array('f', uvs_d),   _arr.array('I', idx_d),   n * 4)
 
     all_rings = [(outer_pts, True)] + [(cut, False) for cut in all_cutouts]
     ring_data = [build_side_ring(pts, out) for pts, out in all_rings]
@@ -928,7 +950,7 @@ def build_board_mesh(outer_chain, cutout_chains, layer_circles,
         side_verts.extend(sv)
         side_norms.extend(sn)
         side_uvs.extend(su)
-        side_idx.extend(v + vert_base for v in si)
+        side_idx.extend([v + vert_base for v in si])
         vert_base += vc
 
     return (
