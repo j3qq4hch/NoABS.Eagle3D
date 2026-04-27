@@ -10,6 +10,7 @@ generatePCB.py
 
 Зависимости:
     pip install pillow earcut
+    pip install mapbox-earcut numpy   # рекомендуется: C++ бэкенд, в 50-100x быстрее
 """
 
 import xml.etree.ElementTree as ET
@@ -22,6 +23,7 @@ import argparse
 import array as _arr
 import logging
 import shutil
+from collections import defaultdict
 from pathlib import Path
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageStat
@@ -55,7 +57,9 @@ DEFAULT_COLORS = {
     "silkscreencolor": (255, 255, 255, 255),  # #ffffff
     "soldermaskcolor": (  0, 140,  74, 255),  # #008C4A
 }
-ARC_SEGMENTS      = 64
+ARC_SEGMENTS        = 64  # arc resolution for board outer outline
+CUTOUT_ARC_SEGMENTS = 6   # arc resolution for cutout/milling polygons (fewer = faster earcut)
+HOLE_SEGMENTS       = 24  # arc resolution for circular drill holes
 
 _TEX_REQUIRED = [
     "outline.png",
@@ -620,44 +624,70 @@ def _matches(ax, ay, bx, by, tol=1e-3):
 
 
 def _dedup_wires(wires, tol=1e-3, curve_tol=0.5):
-    """Remove duplicate wires — same arc encoded twice (same or opposite direction)."""
-    kept = []
-    for a in wires:
-        is_dup = False
-        for b in kept:
-            same_dir = (_matches(a["x1"], a["y1"], b["x1"], b["y1"], tol) and
-                        _matches(a["x2"], a["y2"], b["x2"], b["y2"], tol) and
-                        abs(a["curve"] - b["curve"]) < curve_tol)
-            rev_dir  = (_matches(a["x1"], a["y1"], b["x2"], b["y2"], tol) and
-                        _matches(a["x2"], a["y2"], b["x1"], b["y1"], tol) and
-                        abs(a["curve"] + b["curve"]) < curve_tol)
-            if same_dir or rev_dir:
-                is_dup = True
-                break
-        if not is_dup:
-            kept.append(a)
+    """Remove duplicate wires — same arc encoded twice (same or opposite direction). O(n)."""
+    inv_t  = 1.0 / tol
+    inv_ct = 1.0 / curve_tol
+    seen   = set()
+    kept   = []
+    for w in wires:
+        x1 = round(w["x1"] * inv_t);  y1 = round(w["y1"] * inv_t)
+        x2 = round(w["x2"] * inv_t);  y2 = round(w["y2"] * inv_t)
+        cv = round(w["curve"] * inv_ct)
+        k_fwd = (x1, y1, x2, y2,  cv)
+        k_rev = (x2, y2, x1, y1, -cv)
+        if k_fwd in seen or k_rev in seen:
+            continue
+        seen.add(k_fwd)
+        kept.append(w)
     return kept
 
 
 def chain_segments(wires, tol=1e-3):
+    """Assemble wire segments into chains. O(n) via endpoint hash index."""
     wires = _dedup_wires(wires, tol)
-    remaining = list(range(len(wires)))
+    if not wires:
+        return []
+
+    inv_t = 1.0 / tol
+
+    def _key(x, y):
+        return (round(x * inv_t), round(y * inv_t))
+
+    # Map each endpoint key to list of (wire_idx, flipped):
+    #   flipped=False → segment used as-is (start=x1,y1)
+    #   flipped=True  → segment reversed   (start=x2,y2)
+    ep_idx = defaultdict(list)
+    for i, w in enumerate(wires):
+        ep_idx[_key(w["x1"], w["y1"])].append((i, False))
+        ep_idx[_key(w["x2"], w["y2"])].append((i, True))
+
+    used   = [False] * len(wires)
     chains = []
-    while remaining:
-        idx = remaining.pop(0)
-        chain = [(wires[idx], False)]
+
+    for start_i in range(len(wires)):
+        if used[start_i]:
+            continue
+        used[start_i] = True
+        chain = [(wires[start_i], False)]
+
         while True:
             ex, ey = _seg_end(*chain[-1])
-            found = False
-            for i in remaining:
-                s = wires[i]
-                if _matches(ex, ey, s["x1"], s["y1"], tol):
-                    chain.append((s, False)); remaining.remove(i); found = True; break
-                if _matches(ex, ey, s["x2"], s["y2"], tol):
-                    chain.append((s, True));  remaining.remove(i); found = True; break
+            found  = False
+            for j, flipped in ep_idx.get(_key(ex, ey), []):
+                if used[j]:
+                    continue
+                sx = wires[j]["x2"] if flipped else wires[j]["x1"]
+                sy = wires[j]["y2"] if flipped else wires[j]["y1"]
+                if _matches(ex, ey, sx, sy, tol):
+                    chain.append((wires[j], flipped))
+                    used[j] = True
+                    found = True
+                    break
             if not found:
                 break
+
         chains.append(chain)
+
     return chains
 
 
@@ -756,9 +786,9 @@ def triangulate_face(outer_pts, holes_pts):
         all_pts.extend(h)
         ring_ends.append(len(all_pts))
 
-    flat         = [coord for pt in all_pts for coord in pt]
-    hole_starts  = ring_ends[:-1] if len(ring_ends) > 1 else None
-    indices      = _earcut(flat, hole_starts, 2)
+    flat        = [coord for pt in all_pts for coord in pt]
+    hole_starts = ring_ends[:-1] if len(ring_ends) > 1 else None
+    indices     = _earcut(flat, hole_starts, 2)
     return all_pts, list(indices)
 
 
@@ -798,12 +828,12 @@ def build_board_mesh(outer_chain, cutout_chains, layer_circles,
     idx_u32   — array.array('I') плоский: [i0,i1,i2, ...]
     """
     outer_pts    = chain_to_polygon(outer_chain)
-    cutout_polys = [chain_to_polygon(ch) for ch in cutout_chains]
+    cutout_polys = [chain_to_polygon(ch, n=CUTOUT_ARC_SEGMENTS) for ch in cutout_chains]
     cutout_polys += [circle_to_polygon(c["x"], c["y"], c["radius"]) for c in layer_circles]
 
     hole_polys = []
     for h in board_holes + comp_holes:
-        hole_polys.append(circle_to_polygon(h["x"], h["y"], h["radius"], n=24))
+        hole_polys.append(circle_to_polygon(h["x"], h["y"], h["radius"], n=HOLE_SEGMENTS))
 
     all_cutouts = cutout_polys + hole_polys
 
@@ -823,7 +853,12 @@ def build_board_mesh(outer_chain, cutout_chains, layer_circles,
     def uv_bottom(x, y):
         return (x - xmin) / dx, 1.0 - (y - ymin) / dy
 
+    import time as _time
+    _t0 = _time.monotonic()
+    log.debug("Earcut: контур=%d вершин, вырезов=%d, точек в вырезах=%d",
+              len(outer_pts), len(all_cutouts), sum(len(h) for h in all_cutouts))
     face_pts, face_idx = triangulate_face(outer_pts, all_cutouts)
+    log.debug("Earcut завершён за %.1f мс", (_time.monotonic() - _t0) * 1000)
     n_face = len(face_pts)
 
     # Верхняя грань
