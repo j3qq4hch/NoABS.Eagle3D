@@ -18,6 +18,8 @@ import logging
 import time
 from pathlib import Path
 
+from PIL import Image, ImageChops
+
 # ── Импортируем building blocks из generatePCB и addComponents ──
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
@@ -26,19 +28,61 @@ if str(_HERE) not in sys.path:
 from generatePCB import (
     load_brd,
     get_component_holes,
-    get_colors,
     get_thickness,
-    parse_color,
     extract_footprint_outline,
     chain_segments,
     classify_chains,
     build_board_mesh,
-    process_textures,
     build_glb,
     DEFAULT_LAYER,
     DEFAULT_THICKNESS,
-    DEFAULT_COLORS,
 )
+
+SUBSTRATE_COLOR = (120, 110, 70, 255)  # #786E46
+
+# Magenta (255, 0, 255) — цвет контура платы (layer 20), задаётся в ULP palette 19
+_OUTLINE_RGB = (255, 0, 255)
+_OUTLINE_TOL = 30
+
+
+def _outline_mask(img: Image.Image) -> Image.Image:
+    """L-маска: 255 там где пиксель совпадает с цветом контура (маджента)."""
+    r, g, b = img.convert("RGB").split()
+    r0, g0, b0 = _OUTLINE_RGB
+    tol = _OUTLINE_TOL
+    r_m = r.point(bytes(255 if abs(i - r0) <= tol else 0 for i in range(256)))
+    g_m = g.point(bytes(255 if abs(i - g0) <= tol else 0 for i in range(256)))
+    b_m = b.point(bytes(255 if abs(i - b0) <= tol else 0 for i in range(256)))
+    return ImageChops.multiply(ImageChops.multiply(r_m, g_m), b_m)
+
+
+def _crop_textures(img_top: Image.Image, img_bot: Image.Image):
+    """
+    Обрезать обе текстуры по одному bounding box контура платы.
+    Контур (layer 20) окрашен маджентой ULP-скриптом — он одинаков в обоих изображениях,
+    поэтому обрезка выровнена даже если tPlace выходит за пределы платы.
+    Маджента заменяется фоновым цветом (= цвет маски) перед обрезкой.
+    """
+    outline_top = _outline_mask(img_top)
+    outline_bot = _outline_mask(img_bot)
+    bbox = outline_top.getbbox() or outline_bot.getbbox()
+    if bbox is None:
+        log.warning("Контур платы (маджента) не найден в текстуре, обрезка пропущена")
+        return img_top, img_bot
+
+    bg_rgb = img_top.convert("RGB").getpixel((0, 0))
+    log.info("Обрезка текстур: %dx%d → %dx%d",
+             img_top.size[0], img_top.size[1], bbox[2] - bbox[0], bbox[3] - bbox[1])
+
+    def clean_and_crop(img, outline):
+        bg_fill = Image.new("RGB", img.size, bg_rgb).convert(img.mode)
+        result = img.copy()
+        result.paste(bg_fill, mask=outline)
+        return result.crop(bbox)
+
+    return clean_and_crop(img_top, outline_top), clean_and_crop(img_bot, outline_bot)
+
+
 from addComponents import (
     read_brd as read_brd_components,
     build_glb_index,
@@ -53,20 +97,18 @@ log = logging.getLogger("eagle2gltf1")
 # ══════════════════════════════════════════════
 
 def process(brd_path, output_path, thickness_override, layer,
-            glb_dir=None, tex_dir_override=None, colors_override=None,
+            glb_dir=None, tex_dir_override=None,
             min_priority=0):
     """
     Полный pipeline: BRD → GLB платы с текстурами и (опционально) компонентами.
 
     Аргументы:
-        brd_path          — путь к .brd файлу
-        output_path       — путь к выходному .glb
+        brd_path           — путь к .brd файлу
+        output_path        — путь к выходному .glb
         thickness_override — толщина платы в мм (None = из BRD)
-        layer             — слой контура платы (default: "20")
-        glb_dir           — директория с GLB моделями компонентов (None = без компонентов)
-        tex_dir_override  — директория с PNG текстурами (None = авто)
-        colors_override   — dict цветов из CLI (substratecolor и др.) в виде (R,G,B,A);
-                            перекрывает значения из BRD, DEFAULT_COLORS — fallback
+        layer              — слой контура платы (default: "20")
+        glb_dir            — директория с GLB моделями компонентов (None = без компонентов)
+        tex_dir_override   — директория с PNG текстурами (None = авто)
     """
     brd_path    = Path(brd_path)
     output_path = Path(output_path)
@@ -86,11 +128,7 @@ def process(brd_path, output_path, thickness_override, layer,
     # ── Шаг 1: геометрия платы ──
     root, wires, circles, holes = load_brd(brd_path, layer)
     comp_holes = get_component_holes(root)
-
-    # Приоритет цветов: CLI > BRD > DEFAULT_COLORS
-    brd_colors   = get_colors(root)
-    final_colors = {**DEFAULT_COLORS, **brd_colors, **(colors_override or {})}
-    side_color   = final_colors["substratecolor"]
+    side_color = SUBSTRATE_COLOR
     log.info("Цвет торца: RGBA%s", side_color)
 
     if thickness_override is not None:
@@ -152,9 +190,15 @@ def process(brd_path, output_path, thickness_override, layer,
 
     t_tex = time.perf_counter()
     if tex_dir.exists():
-        ok = process_textures(brd_path, tex_dir, work_dir, colors_override=final_colors)
-        if not ok:
-            log.warning("Обработка текстур не удалась - GLB будет без текстур")
+        pre_top = tex_dir / "top_texture.png"
+        pre_bot = tex_dir / "bottom_texture.png"
+        if pre_top.exists() and pre_bot.exists():
+            img_top, img_bot = _crop_textures(Image.open(pre_top), Image.open(pre_bot))
+            img_top.save(str(tex_top))
+            img_bot.save(str(tex_bot))
+            log.info("Текстуры обработаны и сохранены")
+        else:
+            log.warning("Текстуры Eagle не найдены в %s", tex_dir)
     else:
         log.warning("Директория текстур не найдена: %s - GLB без текстур", tex_dir)
 
@@ -214,14 +258,6 @@ def main():
                         help="Минимальный Priority3d компонента для включения в модель (default: 0 — все)")
     parser.add_argument("--textures", default=None,
                         help="Директория с PNG текстурами (default: <brd_stem>_textures/)")
-    parser.add_argument("--substrate-color", default=None, metavar="0xAARRGGBB",
-                        help="Цвет торца/подложки платы (default: 0xFF786E46)")
-    parser.add_argument("--copper-color", default=None, metavar="0xAARRGGBB",
-                        help="Цвет меди (default: 0xFFC0C0C0)")
-    parser.add_argument("--silkscreen-color", default=None, metavar="0xAARRGGBB",
-                        help="Цвет шелкографии (default: 0xFFFFFFFF)")
-    parser.add_argument("--soldermask-color", default=None, metavar="0xAARRGGBB",
-                        help="Цвет паяльной маски (default: 0xFF008C4A)")
     parser.add_argument("--log", default=None,
                         help="Путь к лог-файлу (default: только stdout)")
     args = parser.parse_args()
@@ -253,21 +289,8 @@ def main():
     glb_dir          = Path(args.components).resolve() if args.components else None
     tex_dir_override = Path(args.textures).resolve() if args.textures else None
 
-    cli_color_args = {
-        "substratecolor":  args.substrate_color,
-        "coppercolor":     args.copper_color,
-        "silkscreencolor": args.silkscreen_color,
-        "soldermaskcolor": args.soldermask_color,
-    }
-    colors_override = {
-        name: parse_color(val)
-        for name, val in cli_color_args.items()
-        if val is not None
-    }
-
     try:
         process(brd_path, output, args.thickness, args.layer, glb_dir, tex_dir_override,
-                colors_override=colors_override or None,
                 min_priority=args.min_priority)
     except Exception as e:
         import traceback

@@ -21,6 +21,7 @@ import json
 import argparse
 import array as _arr
 import logging
+import shutil
 from pathlib import Path
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageStat
@@ -1141,13 +1142,18 @@ def process(brd_path: Path, thickness_override=None, layer=DEFAULT_LAYER,
     tex_bot = output_dir / "texture_bottom.png"
 
     if tex_top.exists() and tex_bot.exists():
-        log.info("Обработанные текстуры уже есть в NoABS_tmp, повторная обработка пропущена")
+        log.info("Текстуры уже есть в NoABS_tmp, пропускаем")
     elif tex_dir.exists():
-        ok = process_textures(brd_path, tex_dir, output_dir)
-        if not ok:
-            log.warning("Обработка текстур не удалась - GLB будет без текстур")
+        pre_top = tex_dir / "top_texture.png"
+        pre_bot = tex_dir / "bottom_texture.png"
+        if pre_top.exists() and pre_bot.exists():
+            shutil.copy2(pre_top, tex_top)
+            shutil.copy2(pre_bot, tex_bot)
+            log.info("Текстуры скопированы из Eagle экспорта")
+        else:
+            log.warning("Текстуры Eagle не найдены в %s", tex_dir)
     else:
-        log.warning("Текстуры недоступны")
+        log.warning("Директория текстур не найдена: %s", tex_dir)
 
     if tex_top.exists():
         dpi = read_png_dpi(tex_top)

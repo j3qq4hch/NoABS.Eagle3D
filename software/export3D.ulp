@@ -1,19 +1,7 @@
 #usage "Export board textures and generate 3D GLB model.\n\
 Usage:\n\
-  RUN export3D_raw.ulp                                  -- interactive (dialog / saved settings)\n\
-  RUN export3D_raw.ulp CLEAN                            -- remove NoABS_tmp folder\n\
-  RUN export3D_raw.ulp SILENT                           -- CLI: all settings from ini, no dialogs\n\
-  RUN export3D_raw.ulp '<dpi>'                          -- CLI: DPI only, other settings from ini\n\
-  RUN export3D_raw.ulp '<glb_dir>' '<dpi>'              -- CLI: glb_dir + DPI, min_priority from ini\n\
-  RUN export3D_raw.ulp '<glb_dir>' '<dpi>' '<minpri>'   -- CLI: all three explicit\n\
-    glb_dir : path to GLB components folder, or empty string '' for no components\n\
-    dpi     : export image DPI (e.g. 400)\n\
-    minpri  : minimum Priority3d to include (0 = all, default 0)\n\
-CLI via eaglecon using saved settings (no dialogs):\n\
-  eaglecon.exe -C \"run export3D_raw.ulp 'SILENT'; UNDO; QUIT\" board.brd\n\
-CLI via eaglecon with explicit args:\n\
-  eaglecon.exe -C \"run export3D_raw.ulp 'C:/libs/glb' '400' '1'; UNDO; QUIT\" board.brd\n\
-Note: UNDO reverts ratsnest fill so the board is not marked as modified before QUIT."
+  RUN export3D.ulp       -- run silently if already configured, else show dialog\n\
+  RUN export3D.ulp SET   -- always show settings dialog"
 
 string win_path(string s)
 {
@@ -46,21 +34,21 @@ string read_ini_value(string ini_path, string key)
 
 void main()
 {
-  // ── CLEAN режим ──────────────────────────────────────────────────────────────
-  if (argc >= 2 && strupr(argv[1]) == "CLEAN")
-  {
-    if (!board) { dlgMessageBox("Error: no .brd file is open."); exit(1); }
-    string bd, tmp;
-    board(B) { bd = filedir(B.name); tmp = bd + "NoABS_tmp/"; }
-    system("cmd.exe /c rmdir /s /q \"" + win_path(tmp) + "\" 2>nul");
-    dlgMessageBox("NoABS_tmp cleaned:\n" + tmp);
-    exit(0);
-  }
+  string board_dir, brd_stem, brd_full, tmp_dir, textures_dir;
+  string scripts_dir, settings_ini, ini_path, step2_path;
+  string glb_dir, dpi_str, cmd, s, v;
+  string mp_save, mc_save, fc_save, sc_save, dpi_save;
+  int min_priority, mask_choice, finish_choice, silk_choice, dpi;
+  int set_mode, show_dialog, slen, ci, i, p, aa, rr, gg, bb;
+  int r_mask, g_mask, b_mask, r_cu, g_cu, b_cu;
+  int r_fin, g_fin, b_fin, r_silk, g_silk, b_silk;
+  int saved_pal[], saved_col[];
+  string mask_names[], finish_names[], silk_names[];
+  int mask_color[], copper_color[], finish_color[], silk_color[];
 
   if (!board) { dlgMessageBox("Error: no .brd file is open."); exit(1); }
 
-  // ── Пути из открытой платы ───────────────────────────────────────────────────
-  string board_dir, brd_stem, brd_full, tmp_dir, textures_dir;
+  // ── Board paths ─────────────────────────────────────────────────────────────
   board(B)
   {
     board_dir    = filedir(B.name);
@@ -70,141 +58,116 @@ void main()
     textures_dir = tmp_dir + brd_stem + "_textures/";
   }
 
-  // scripts_dir — всегда папка самого ULP
-  string scripts_dir = filedir(argv[0]);
+  scripts_dir  = filedir(argv[0]);
+  settings_ini = tmp_dir + "export3d_settings.ini";
 
-  string settings_ini = tmp_dir + "export3d_settings.ini";
+  // ── Color presets ────────────────────────────────────────────────────────────
+  mask_names[0] = "Green";   mask_color[0] = 0x1A7C0F; copper_color[0] = 0x298D29;
+  mask_names[1] = "Blue";    mask_color[1] = 0x1A18BF; copper_color[1] = 0x2828D8;
+  mask_names[2] = "Red";     mask_color[2] = 0x9F180F; copper_color[2] = 0xAE2929;
+  mask_names[3] = "Black";   mask_color[3] = 0x1A180F; copper_color[3] = 0x292929;
+  mask_names[4] = "Purple";  mask_color[4] = 0x9F1873; copper_color[4] = 0xAE298D;
+  mask_names[5] = "White";   mask_color[5] = 0xE2E0D7; copper_color[5] = 0xF1F1F1;
 
-  // ── Значения по умолчанию ────────────────────────────────────────────────────
-  int    dpi          = 400;
-  string glb_dir      = "";
-  int    min_priority = 0;
+  finish_names[0] = "ENIG (gold)"; finish_color[0] = 0xD4AF37;
+  finish_names[1] = "HASL (tin)";  finish_color[1] = 0xC0C0C0;
 
-  // ── Определяем режим запуска ─────────────────────────────────────────────────
-  //   argc == 1           → интерактивный (ini или диалог)
-  //   argc == 2, SILENT   → CLI: всё из ini, без диалогов
-  //   argc == 2           → CLI: DPI, остальное из ini
-  //   argc == 3           → CLI: glb_dir + DPI, min_priority из ini
-  //   argc >= 4           → CLI: glb_dir + DPI + min_priority, всё явно
+  silk_names[0] = "White"; silk_color[0] = 0xFEFEFE;
+  silk_names[1] = "Black"; silk_color[1] = 0x010101;
 
-  int silent_mode = (argc == 2 && strupr(argv[1]) == "SILENT");
-  int cli_mode    = (argc >= 2);
+  // ── Defaults ─────────────────────────────────────────────────────────────────
+  glb_dir       = "";
+  min_priority  = 0;
+  mask_choice   = 0;
+  finish_choice = 0;
+  silk_choice   = 0;
+  dpi           = 400;
 
-  if (argc >= 4)
+  set_mode    = (argc == 2 && strupr(argv[1]) == "SET");
+  show_dialog = set_mode || (filesize(settings_ini) <= 0);
+
+  // ── Load saved settings ────────────────────────────────────────────────────
+  if (filesize(settings_ini) > 0)
   {
-    glb_dir      = argv[1];
-    dpi          = strtol(argv[2]);
-    min_priority = strtol(argv[3]);
+    v = read_ini_value(settings_ini, "glb_dir");      if (strlen(v)) glb_dir       = v;
+    v = read_ini_value(settings_ini, "min_priority"); if (strlen(v)) min_priority  = strtol(v);
+    v = read_ini_value(settings_ini, "mask_choice");  if (strlen(v)) mask_choice   = strtol(v);
+    v = read_ini_value(settings_ini, "finish_choice");if (strlen(v)) finish_choice = strtol(v);
+    v = read_ini_value(settings_ini, "silk_choice");  if (strlen(v)) silk_choice   = strtol(v);
+    v = read_ini_value(settings_ini, "dpi");          if (strlen(v)) dpi           = strtol(v);
   }
-  else if (argc == 3)
-  {
-    glb_dir = argv[1];
-    dpi     = strtol(argv[2]);
-    if (filesize(settings_ini) > 0)
-    {
-      string mp_str = read_ini_value(settings_ini, "min_priority");
-      if (strlen(mp_str) > 0) min_priority = strtol(mp_str);
-    }
-  }
-  else if (argc == 2 && !silent_mode)
-  {
-    dpi = strtol(argv[1]);
-    if (filesize(settings_ini) > 0)
-    {
-      string gd = read_ini_value(settings_ini, "glb_dir");
-      glb_dir = gd;
-      string mp_str = read_ini_value(settings_ini, "min_priority");
-      if (strlen(mp_str) > 0) min_priority = strtol(mp_str);
-    }
-  }
-  else
-  {
-    // Интерактивный режим (argc==1) или SILENT (argc==2): загружаем из ini
-    if (filesize(settings_ini) > 0)
-    {
-      string dpi_str = read_ini_value(settings_ini, "dpi");
-      if (strlen(dpi_str) > 0) dpi = strtol(dpi_str);
-      string gd = read_ini_value(settings_ini, "glb_dir");
-      glb_dir = gd;
-      string mp_str = read_ini_value(settings_ini, "min_priority");
-      if (strlen(mp_str) > 0) min_priority = strtol(mp_str);
-    }
 
-    // Диалог — только при первом запуске без SILENT
-    if (filesize(settings_ini) <= 0 && !silent_mode)
+  // ── Dialog ───────────────────────────────────────────────────────────────────
+  if (show_dialog)
+  {
+    if (dlgDialog("Export 3D")
     {
-      system("cmd.exe /c mkdir \"" + win_path(tmp_dir) + "\" 2>nul");
-
-      if (dlgDialog("Export 3D — Initial Setup")
+      dlgGroup("Solder mask")
       {
-        dlgLabel("Settings will be saved and reused on next run.");
-        dlgGroup("Image export")
+        dlgComboBox(mask_names, mask_choice);
+      }
+      dlgGroup("Pad finish")
+      {
+        dlgComboBox(finish_names, finish_choice);
+      }
+      dlgGroup("Silkscreen")
+      {
+        dlgComboBox(silk_names, silk_choice);
+      }
+      dlgHBoxLayout
+      {
+        dlgLabel("DPI:"); dlgIntEdit(dpi, 72, 2400); dlgStretch(1);
+      }
+      dlgGroup("Components (optional)")
+      {
+        dlgHBoxLayout
         {
-          dlgHBoxLayout
-          {
-            dlgLabel("DPI:");
-            dlgIntEdit(dpi, 1, 9999);
-            dlgStretch(1);
-          }
-        }
-        dlgGroup("Components (optional)")
-        {
-          dlgHBoxLayout
-          {
-            dlgLabel("GLB dir:");
-            dlgStringEdit(glb_dir);
-            dlgPushButton("...") glb_dir = dlgDirectory("Select GLB components directory", glb_dir);
-          }
-          dlgHBoxLayout
-          {
-            dlgLabel("Min Priority3d:");
-            dlgIntEdit(min_priority, 0, 9999);
-            dlgStretch(1);
-          }
+          dlgLabel("GLB dir:");
+          dlgStringEdit(glb_dir);
+          dlgPushButton("...") glb_dir = dlgDirectory("Select GLB components directory", glb_dir);
         }
         dlgHBoxLayout
         {
-          dlgPushButton("+OK")     dlgAccept();
-          dlgPushButton("-Cancel") dlgReject();
+          dlgLabel("Min Priority3d:");
+          dlgIntEdit(min_priority, 0, 9999);
+          dlgStretch(1);
         }
-      } != 1)
-        exit(0);
-
-      // Сохраняем настройки
-      string dpi_save; sprintf(dpi_save, "%d", dpi);
-      string mp_save;  sprintf(mp_save,  "%d", min_priority);
-      output(settings_ini, "wt")
-      {
-        printf("dpi=%s\n",          dpi_save);
-        printf("glb_dir=%s\n",      glb_dir);
-        printf("min_priority=%s\n", mp_save);
       }
-    }
+      dlgHBoxLayout
+      {
+        dlgPushButton("+OK")     dlgAccept();
+        dlgPushButton("-Cancel") dlgReject();
+      }
+    } != 1)
+      exit(0);
   }
 
   if (dpi <= 0) dpi = 400;
 
-  // ── Создаём рабочие папки ─────────────────────────────────────────────────────
-  system("cmd.exe /c mkdir \"" + win_path(tmp_dir) + "\" 2>nul");
-  system("cmd.exe /c mkdir \"" + win_path(textures_dir) + "\" 2>nul");
-  system("cmd.exe /c del /f /q \"" + win_path(textures_dir) + "*.png\"");
-
-  // ── step1.log ─────────────────────────────────────────────────────────────────
-  output(win_path(tmp_dir + "step1.log"), "wt")
+  // ── Save settings ────────────────────────────────────────────────────────────
+  sprintf(mp_save,  "%d", min_priority);
+  sprintf(mc_save,  "%d", mask_choice);
+  sprintf(fc_save,  "%d", finish_choice);
+  sprintf(sc_save,  "%d", silk_choice);
+  sprintf(dpi_save, "%d", dpi);
+  output(settings_ini, "wt")
   {
-    printf("board_dir    = %s\n", board_dir);
-    printf("brd_stem     = %s\n", brd_stem);
-    printf("brd_full     = %s\n", brd_full);
-    printf("tmp_dir      = %s\n", tmp_dir);
-    printf("textures_dir = %s\n", textures_dir);
-    printf("scripts_dir  = %s\n", scripts_dir);
-    printf("glb_dir      = %s\n", glb_dir);
-    printf("min_priority = %d\n", min_priority);
-    printf("cli_mode     = %d\n", cli_mode);
+    printf("glb_dir=%s\n",        glb_dir);
+    printf("min_priority=%s\n",   mp_save);
+    printf("mask_choice=%s\n",    mc_save);
+    printf("finish_choice=%s\n",  fc_save);
+    printf("silk_choice=%s\n",    sc_save);
+    printf("dpi=%s\n",            dpi_save);
   }
 
-  // ── ini для step2 ─────────────────────────────────────────────────────────────
-  string ini_path = tmp_dir + "export3d.ini";
+  // ── Create working dirs and clear previous textures (single cmd call) ────────
+  system("cmd.exe /c mkdir \"" + win_path(tmp_dir) + "\" 2>nul"
+       + " & mkdir \"" + win_path(textures_dir) + "\" 2>nul"
+       + " & del /f /q \"" + win_path(textures_dir) + "top_texture.png\" 2>nul"
+       + " & del /f /q \"" + win_path(textures_dir) + "bottom_texture.png\" 2>nul");
+
+  // ── ini for step2 ─────────────────────────────────────────────────────────────
+  ini_path = tmp_dir + "export3d.ini";
   output(ini_path, "wt")
   {
     printf("brd_full=%s\n",      brd_full);
@@ -214,11 +177,33 @@ void main()
     printf("min_priority=%d\n",  min_priority);
   }
 
-  // ── Eagle-команды: экспорт текстур ───────────────────────────────────────────
-  string dpi_str;
+  // ── Extract RGB from presets ─────────────────────────────────────────────────
+  r_mask = (mask_color[mask_choice]     >> 16) & 0xFF;
+  g_mask = (mask_color[mask_choice]     >>  8) & 0xFF;
+  b_mask =  mask_color[mask_choice]            & 0xFF;
+
+  r_cu   = (copper_color[mask_choice]   >> 16) & 0xFF;
+  g_cu   = (copper_color[mask_choice]   >>  8) & 0xFF;
+  b_cu   =  copper_color[mask_choice]          & 0xFF;
+
+  r_fin  = (finish_color[finish_choice] >> 16) & 0xFF;
+  g_fin  = (finish_color[finish_choice] >>  8) & 0xFF;
+  b_fin  =  finish_color[finish_choice]        & 0xFF;
+
+  r_silk = (silk_color[silk_choice]     >> 16) & 0xFF;
+  g_silk = (silk_color[silk_choice]     >>  8) & 0xFF;
+  b_silk =  silk_color[silk_choice]            & 0xFF;
+
+  // ── Save current palette and layer colors ────────────────────────────────────
+  for (i = 0; i < 64; i++)
+    saved_pal[i] = palette(i);
+  board(B) {
+    B.layers(L) saved_col[L.number] = L.color;
+  }
+
+  // ── Eagle commands ────────────────────────────────────────────────────────────
   sprintf(dpi_str, "%d", dpi);
 
-  string cmd;
   cmd  = "EDIT .sch;\n";
   cmd += "VARIANT '';\n";
   cmd += "edit .brd;\n";
@@ -233,45 +218,79 @@ void main()
   cmd += "SET FILL_LAYER 29 1;\n";
   cmd += "SET FILL_LAYER 30 1;\n";
 
-  cmd += "display none;\ndisplay 20;\ndisplay 46;\n";
-  cmd += "EXPORT IMAGE '" + textures_dir + "outline.png' MONOCHROME " + dpi_str + ";\n";
-  cmd += "display none;\ndisplay 1 17 18;\n";
-  cmd += "EXPORT IMAGE '" + textures_dir + "top_copper.png' MONOCHROME " + dpi_str + ";\n";
-  cmd += "display none;\ndisplay 21;\n";
-  cmd += "EXPORT IMAGE '" + textures_dir + "top_silk.png' MONOCHROME " + dpi_str + ";\n";
-  cmd += "display none;\ndisplay 16 17 18;\n";
-  cmd += "EXPORT IMAGE '" + textures_dir + "bottom_copper.png' MONOCHROME " + dpi_str + ";\n";
-  cmd += "display none;\ndisplay 22;\n";
-  cmd += "EXPORT IMAGE '" + textures_dir + "bottom_silk.png' MONOCHROME " + dpi_str + ";\n";
-  cmd += "display none;\ndisplay 29;\n";
-  cmd += "EXPORT IMAGE '" + textures_dir + "top_mask.png' MONOCHROME " + dpi_str + ";\n";
-  cmd += "display none;\ndisplay 30;\n";
-  cmd += "EXPORT IMAGE '" + textures_dir + "bottom_mask.png' MONOCHROME " + dpi_str + ";\n";
-  cmd += "display none;\ndisplay 17;\n";
-  cmd += "EXPORT IMAGE '" + textures_dir + "pads.png' MONOCHROME " + dpi_str + ";\n";
+  // Palette 0  = background = mask color
+  // Palette 16 = pad finish (tStop / bStop)
+  // Palette 17 = copper under mask
+  // Palette 18 = silkscreen
+  // Palette 19 = magenta marker for board outline (layer 20), used by Python to crop
+  sprintf(s, "SET PALETTE 0  0x%02X%02X%02X%02X;\n", 0xFF, r_mask, g_mask, b_mask); cmd += s;
+  sprintf(s, "SET PALETTE 16 0x%02X%02X%02X%02X;\n", 0xFF, r_fin,  g_fin,  b_fin);  cmd += s;
+  sprintf(s, "SET PALETTE 17 0x%02X%02X%02X%02X;\n", 0xFF, r_cu,   g_cu,   b_cu);   cmd += s;
+  sprintf(s, "SET PALETTE 18 0x%02X%02X%02X%02X;\n", 0xFF, r_silk, g_silk, b_silk); cmd += s;
+  cmd += "SET PALETTE 19 0xFFFF00FF;\n";
+  cmd += "SET COLOR_LAYER 20 19;\n";
 
-  cmd += "display none;\n";
+  // ── Top texture ───────────────────────────────────────────────────────────────
+  cmd += "SET COLOR_LAYER 29 16;\n";
+  cmd += "SET COLOR_LAYER 1  17;\n";
+  cmd += "SET COLOR_LAYER 18 17;\n";
+  cmd += "SET COLOR_LAYER 19 17;\n";
+  cmd += "SET COLOR_LAYER 21 18;\n";
+  cmd += "SET Option.LayerSequence 20 29 21 1 18 19;\n";
+  cmd += "DISPLAY NONE;\n";
+  cmd += "DISPLAY 1 18 19 20 21 29;\n";
+  sprintf(s, "EXPORT IMAGE '%s' %s;\n", textures_dir + "top_texture.png", dpi_str);
+  cmd += s;
+
+  // ── Bottom texture ────────────────────────────────────────────────────────────
+  cmd += "SET COLOR_LAYER 30 16;\n";
+  cmd += "SET COLOR_LAYER 16 17;\n";
+  cmd += "SET COLOR_LAYER 17 17;\n";
+  cmd += "SET COLOR_LAYER 18 17;\n";
+  cmd += "SET COLOR_LAYER 22 18;\n";
+  cmd += "SET Option.LayerSequence 20 30 22 16 17 18;\n";
+  cmd += "DISPLAY NONE;\n";
+  cmd += "DISPLAY 16 17 18 20 22 30;\n";
+  sprintf(s, "EXPORT IMAGE '%s' %s;\n", textures_dir + "bottom_texture.png", dpi_str);
+  cmd += s;
+
+  // ── Restore palette and layer colors ─────────────────────────────────────────
+  for (i = 0; i < 64; i++) {
+    p  = saved_pal[i];
+    aa = (p >> 24) & 0xFF;
+    rr = (p >> 16) & 0xFF;
+    gg = (p >>  8) & 0xFF;
+    bb =  p        & 0xFF;
+    sprintf(s, "SET PALETTE %d 0x%02X%02X%02X%02X;\n", i, aa, rr, gg, bb);
+    cmd += s;
+  }
+  board(B) {
+    B.layers(L) {
+      sprintf(s, "SET COLOR_LAYER %d %d;\n", L.number, saved_col[L.number]);
+      cmd += s;
+    }
+  }
+
+  // ── Restore display ───────────────────────────────────────────────────────────
+  cmd += "DISPLAY NONE;\n";
   if (EAGLE_VERSION >= 9)
   {
     cmd += "set Option.SignalNamesOnPads 1;\n";
     cmd += "set Option.SignalNamesOnTraces 1;\n";
   }
   cmd += "set PAD_NAMES ON;\n";
-  cmd += "display 20 17 18 1 21 23 25;\n";
+  cmd += "DISPLAY 20 17 18 1 21 23 25;\n";
 
-  // ── Запускаем step2 ───────────────────────────────────────────────────────────
-  string step2_path = scripts_dir;
-  int slen = strlen(step2_path);
+  // ── Launch step2 ──────────────────────────────────────────────────────────────
+  step2_path = scripts_dir;
+  slen = strlen(step2_path);
   if (slen > 0 && step2_path[slen-1] != '/' && step2_path[slen-1] != '\\')
     step2_path += "/";
-  int ci;
   for (ci = 0; step2_path[ci]; ci++)
     if (step2_path[ci] == '\\') step2_path[ci] = '/';
   step2_path += "export3D_raw_step2.ulp";
 
-  string cli_flag; sprintf(cli_flag, "%d", cli_mode);
-  cmd += "RUN '" + step2_path + "' '" + ini_path + "' '" + cli_flag + "';\n";
-
+  cmd += "RUN '" + step2_path + "' '" + ini_path + "' '0';\n";
 
   exit(cmd);
 }
