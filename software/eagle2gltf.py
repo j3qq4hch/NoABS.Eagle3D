@@ -194,11 +194,13 @@ def process(brd_path, output_path, thickness_override, layer,
     t_tex = time.perf_counter()
     img_top = img_bot = None
     if tex_dir.exists():
-        pre_top = tex_dir / "top_texture.png"
-        pre_bot = tex_dir / "bottom_texture.png"
+        pre_top = tex_dir / "top_texture.bmp"
+        pre_bot = tex_dir / "bottom_texture.bmp"
         if pre_top.exists() and pre_bot.exists():
             img_top, img_bot = _crop_textures(Image.open(pre_top), Image.open(pre_bot))
-            log.info("Текстуры обработаны")
+            pre_top.unlink(missing_ok=True)
+            pre_bot.unlink(missing_ok=True)
+            log.info("Текстуры обработаны, BMP удалены")
         else:
             log.warning("Текстуры Eagle не найдены в %s", tex_dir)
     else:

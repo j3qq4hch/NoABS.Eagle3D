@@ -165,8 +165,8 @@ void main()
   // ── Create working dirs and clear previous textures (single cmd call) ────────
   system("cmd.exe /c mkdir \"" + win_path(tmp_dir) + "\" 2>nul"
        + " & mkdir \"" + win_path(textures_dir) + "\" 2>nul"
-       + " & del /f /q \"" + win_path(textures_dir) + "top_texture.png\" 2>nul"
-       + " & del /f /q \"" + win_path(textures_dir) + "bottom_texture.png\" 2>nul");
+       + " & del /f /q \"" + win_path(textures_dir) + "top_texture.bmp\" 2>nul"
+       + " & del /f /q \"" + win_path(textures_dir) + "bottom_texture.bmp\" 2>nul");
 
   // ── ini for step2 ─────────────────────────────────────────────────────────────
   ini_path = tmp_dir + "export3d.ini";
@@ -241,7 +241,7 @@ void main()
   cmd += "SET Option.LayerSequence 20 21 29 1 18 19;\n";
   cmd += "DISPLAY NONE;\n";
   cmd += "DISPLAY 1 18 19 20 21 29;\n";
-  sprintf(s, "EXPORT IMAGE '%s' %s;\n", textures_dir + "top_texture.png", dpi_str);
+  sprintf(s, "EXPORT IMAGE '%s' %s;\n", textures_dir + "top_texture.bmp", dpi_str);
   cmd += s;
 
   // ── Bottom texture ────────────────────────────────────────────────────────────
@@ -253,7 +253,7 @@ void main()
   cmd += "SET Option.LayerSequence 20 22 30 16 17 18;\n";
   cmd += "DISPLAY NONE;\n";
   cmd += "DISPLAY 16 17 18 20 22 30;\n";
-  sprintf(s, "EXPORT IMAGE '%s' %s;\n", textures_dir + "bottom_texture.png", dpi_str);
+  sprintf(s, "EXPORT IMAGE '%s' %s;\n", textures_dir + "bottom_texture.bmp", dpi_str);
   cmd += s;
 
   // ── Restore palette and layer colors ─────────────────────────────────────────

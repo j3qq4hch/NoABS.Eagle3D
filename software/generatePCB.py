@@ -706,8 +706,9 @@ def build_glb(primitives_data, tex_top, tex_bot,
         if isinstance(source, Path):
             with open(source, "rb") as f:
                 return f.read()
+        img = source if source.mode in ("RGB", "L") else source.convert("RGB")
         buf = io.BytesIO()
-        source.save(buf, format="PNG", compress_level=1)
+        img.save(buf, format="JPEG", quality=92)
         return buf.getvalue()
 
     def _has_tex(t):
@@ -731,10 +732,11 @@ def build_glb(primitives_data, tex_top, tex_bot,
             tex_bot = _encode(tex_bot)
 
     def add_image(source, name: str) -> int:
-        png = source if isinstance(source, bytes) else _encode(source)
-        bv_img  = append_bin(png)
+        data    = source if isinstance(source, bytes) else _encode(source)
+        mime    = "image/jpeg" if data[:2] == b'\xff\xd8' else "image/png"
+        bv_img  = append_bin(data)
         img_idx = len(images)
-        images.append({"bufferView": bv_img, "mimeType": "image/png", "name": name})
+        images.append({"bufferView": bv_img, "mimeType": mime, "name": name})
         tex_idx = len(textures)
         textures.append({"source": img_idx, "sampler": 0})
         return tex_idx
@@ -914,34 +916,28 @@ def process(brd_path: Path, thickness_override=None, layer=DEFAULT_LAYER,
     if not tex_dir.exists():
         log.warning("Директория текстур не найдена: %s - GLB будет без текстур", tex_dir)
 
-    tex_top = output_dir / "texture_top.png"
-    tex_bot = output_dir / "texture_bottom.png"
-
-    if tex_top.exists() and tex_bot.exists():
-        log.info("Текстуры уже есть в NoABS_tmp, пропускаем")
-    elif tex_dir.exists():
-        pre_top = tex_dir / "top_texture.png"
-        pre_bot = tex_dir / "bottom_texture.png"
+    img_top = img_bot = None
+    if tex_dir.exists():
+        pre_top = tex_dir / "top_texture.bmp"
+        pre_bot = tex_dir / "bottom_texture.bmp"
         if pre_top.exists() and pre_bot.exists():
-            shutil.copy2(pre_top, tex_top)
-            shutil.copy2(pre_bot, tex_bot)
-            log.info("Текстуры скопированы из Eagle экспорта")
+            img_top = Image.open(pre_top).copy()
+            img_bot = Image.open(pre_bot).copy()
+            pre_top.unlink(missing_ok=True)
+            pre_bot.unlink(missing_ok=True)
+            log.info("Текстуры загружены, BMP удалены")
         else:
             log.warning("Текстуры Eagle не найдены в %s", tex_dir)
     else:
         log.warning("Директория текстур не найдена: %s", tex_dir)
 
-    if tex_top.exists():
-        dpi = read_png_dpi(tex_top)
-        if dpi:
-            log.info("DPI выходной текстуры top: %.1f x %.1f", dpi[0], dpi[1])
-    if not tex_top.exists():
-        log.warning("texture_top.png отсутствует")
-    if not tex_bot.exists():
-        log.warning("texture_bottom.png отсутствует")
+    if img_top is None:
+        log.warning("texture_top отсутствует")
+    if img_bot is None:
+        log.warning("texture_bottom отсутствует")
 
     log.info("Собираем GLB...")
-    build_glb(prim_data, tex_top, tex_bot, side_color, output_path)
+    build_glb(prim_data, img_top, img_bot, side_color, output_path)
 
     log.info("Выходной файл: %s", output_path.resolve())
     return output_path.resolve()

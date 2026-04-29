@@ -1,12 +1,146 @@
 """
-Earcut polygon triangulation — pure Python, no numpy.
-Ported from mapbox/earcut.js by the earcut PyPI package authors,
-numpy dependency removed (we only use dim=2).
+Earcut polygon triangulation.
+Uses mapbox-earcut C++ backend if available (pip install mapbox-earcut),
+otherwise falls back to the pure Python implementation below.
 """
 import math
+import logging as _logging
+import subprocess as _subprocess
+import sys as _sys
 
+_log = _logging.getLogger("generatePCB")
+
+
+def _probe_mapbox_earcut():
+    """
+    Test mapbox-earcut in a subprocess (safe against DLL crashes).
+
+    Tries two input strategies in order:
+      1. memoryview  — no numpy import in the main process → numpy excluded from PyInstaller bundle
+      2. numpy       — fallback if nanobind rejects plain buffer protocol
+
+    Returns a dict with keys 'strategy' ('memoryview'|'numpy') and 'rings' ('cumulative'|'counts'),
+    or None if mapbox-earcut is not usable.
+    """
+    probe = r"""
+import sys, array as _a
+from mapbox_earcut import triangulate_float64 as mbc
+
+coords = [0,0,1,0,1,1,0,1, 0.3,0.3,0.7,0.3,0.5,0.7]
+n = len(coords) // 2
+
+def _check(verts, rings_arr):
+    try:
+        res = mbc(verts, rings_arr)
+        out = list(res)
+        return len(out) > 0 and len(out) % 3 == 0
+    except Exception:
+        return False
+
+# Strategy 1: memoryview — no numpy needed at runtime
+try:
+    c_arr = _a.array('d', coords)
+    c_mv  = memoryview(c_arr).cast('d', shape=[n, 2])
+    for label, rdata in [('cumulative',[4,7]), ('counts',[4,3])]:
+        r_mv = memoryview(_a.array('I', rdata))
+        if _check(c_mv, r_mv):
+            print('memoryview', label, flush=True); sys.exit(0)
+except Exception:
+    pass
+
+# Strategy 2: numpy
+try:
+    import numpy as np
+    c_np = np.array(coords, dtype=np.float64).reshape(-1, 2)
+    for label, rdata in [('cumulative',[4,7]), ('counts',[4,3])]:
+        r_np = np.array(rdata, dtype=np.uint32)
+        if _check(c_np, r_np):
+            print('numpy', label, flush=True); sys.exit(0)
+except Exception:
+    pass
+"""
+    try:
+        result = _subprocess.run(
+            [_sys.executable, "-c", probe],
+            capture_output=True, text=True, timeout=10
+        )
+        parts = result.stdout.strip().split()
+        if len(parts) == 2 and parts[0] in ("memoryview", "numpy") \
+                            and parts[1] in ("cumulative", "counts"):
+            return {"strategy": parts[0], "rings": parts[1]}
+    except Exception:
+        pass
+    return None
+
+
+def _build_fast_earcut(probe_result):
+    from mapbox_earcut import triangulate_float64 as _mbc
+    import array as _arr
+
+    _strategy   = probe_result["strategy"]
+    _cumulative = probe_result["rings"] == "cumulative"
+
+    def _make_rings(holeIndices, n_total):
+        if holeIndices:
+            cum_ends = list(holeIndices) + [n_total]
+            if _cumulative:
+                return _arr.array('I', cum_ends)
+            starts = [0] + list(holeIndices)
+            return _arr.array('I', [cum_ends[i] - starts[i] for i in range(len(cum_ends))])
+        return _arr.array('I', [n_total])
+
+    if _strategy == "memoryview":
+        # No numpy imported in main process → PyInstaller will not bundle numpy
+        def _fast(data, holeIndices=None, dim=None):
+            n_total  = len(data) // 2
+            c_arr    = _arr.array('d', data)
+            c_mv     = memoryview(c_arr).cast('d', shape=[n_total, 2])
+            rings    = _make_rings(holeIndices, n_total)
+            r_mv     = memoryview(rings)
+            return list(_mbc(c_mv, r_mv))
+    else:
+        import numpy as _np
+        def _fast(data, holeIndices=None, dim=None):
+            n_total = len(data) // 2
+            verts   = _np.array(data, dtype=_np.float64).reshape(-1, 2)
+            rings   = _np.array(_make_rings(holeIndices, n_total), dtype=_np.uint32)
+            return _mbc(verts, rings).tolist()
+
+    return _fast
+
+
+_probe_result = _probe_mapbox_earcut()
+if _probe_result:
+    try:
+        _fast_earcut = _build_fast_earcut(_probe_result)
+        _log.debug("mapbox-earcut C++ backend активен "
+                   "(strategy=%s, rings=%s)",
+                   _probe_result["strategy"], _probe_result["rings"])
+    except Exception as _e:
+        _fast_earcut = None
+        _log.warning("mapbox-earcut недоступен: %s", _e)
+else:
+    _fast_earcut = None
+    _log.debug("mapbox-earcut недоступен, используем чистый Python")
+
+
+_backend_logged = False
 
 def earcut(data, holeIndices=None, dim=None):
+    global _backend_logged
+    if not _backend_logged:
+        _backend_logged = True
+        if _fast_earcut is not None:
+            _log.info("earcut: C++ backend (strategy=%s, rings=%s)",
+                      _probe_result["strategy"], _probe_result["rings"])
+        else:
+            _log.warning("earcut: pure Python fallback (slow for many holes)")
+    if _fast_earcut is not None:
+        return _fast_earcut(data, holeIndices, dim)
+    return _earcut_python(data, holeIndices, dim)
+
+
+def _earcut_python(data, holeIndices=None, dim=None):
     dim = dim or 2
     hasHoles = holeIndices and len(holeIndices)
     outerLen = holeIndices[0] * dim if hasHoles else len(data)
