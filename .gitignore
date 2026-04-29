@@ -85,3 +85,4 @@ software/.vscode/
 /build_venv
 /NoABS_tmp
 /.claude
+/CropTest

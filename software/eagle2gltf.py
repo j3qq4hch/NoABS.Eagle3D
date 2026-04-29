@@ -19,6 +19,7 @@ import logging
 import time
 from pathlib import Path
 
+import numpy as np
 from PIL import Image, ImageChops
 
 # ── Импортируем building blocks из generatePCB и addComponents ──
@@ -61,27 +62,31 @@ def _crop_textures(img_top: Image.Image, img_bot: Image.Image):
     """
     Обрезать обе текстуры по одному bounding box контура платы.
     Контур (layer 20) окрашен маджентой ULP-скриптом — он одинаков в обоих изображениях,
-    поэтому обрезка выровнена даже если tPlace выходит за пределы платы.
-    Маджента заменяется фоновым цветом (= цвет маски) перед обрезкой.
+    поэтому маску считаем один раз по top.
+    Маджента заменяется фоновым цветом через numpy (sparse write по пикселям контура).
     """
-    outline_top = _outline_mask(img_top)
-    outline_bot = _outline_mask(img_bot)
-    bbox = outline_top.getbbox() or outline_bot.getbbox()
+    outline = _outline_mask(img_top)
+    bbox = outline.getbbox()
     if bbox is None:
         log.warning("Контур платы (маджента) не найден в текстуре, обрезка пропущена")
         return img_top, img_bot
 
     bg_rgb = img_top.convert("RGB").getpixel((0, 0))
-    log.info("Обрезка текстур: %dx%d → %dx%d",
+    log.info("Обрезка текстур: %dx%d -> %dx%d",
              img_top.size[0], img_top.size[1], bbox[2] - bbox[0], bbox[3] - bbox[1])
 
-    def clean_and_crop(img, outline):
-        bg_fill = Image.new("RGB", img.size, bg_rgb).convert(img.mode)
-        result = img.copy()
-        result.paste(bg_fill, mask=outline)
-        return result.crop(bbox)
+    mask_bool = np.array(outline, dtype=bool)
 
-    return clean_and_crop(img_top, outline_top), clean_and_crop(img_bot, outline_bot)
+    def clean_and_crop(img):
+        arr = np.array(img)
+        if arr.ndim == 3:
+            bg = bg_rgb + (255,) * (arr.shape[2] - 3)
+        else:
+            bg = int(0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2])
+        arr[mask_bool] = bg
+        return Image.fromarray(arr).crop(bbox)
+
+    return clean_and_crop(img_top), clean_and_crop(img_bot)
 
 
 from addComponents import (
@@ -186,33 +191,29 @@ def process(brd_path, output_path, thickness_override, layer,
 
     log.info("Ищем текстуры в: %s", tex_dir)
 
-    tex_top = work_dir / "texture_top.png"
-    tex_bot = work_dir / "texture_bottom.png"
-
     t_tex = time.perf_counter()
+    img_top = img_bot = None
     if tex_dir.exists():
         pre_top = tex_dir / "top_texture.png"
         pre_bot = tex_dir / "bottom_texture.png"
         if pre_top.exists() and pre_bot.exists():
             img_top, img_bot = _crop_textures(Image.open(pre_top), Image.open(pre_bot))
-            img_top.save(str(tex_top))
-            img_bot.save(str(tex_bot))
-            log.info("Текстуры обработаны и сохранены")
+            log.info("Текстуры обработаны")
         else:
             log.warning("Текстуры Eagle не найдены в %s", tex_dir)
     else:
         log.warning("Директория текстур не найдена: %s - GLB без текстур", tex_dir)
 
-    if not tex_top.exists():
-        log.warning("texture_top.png отсутствует")
-    if not tex_bot.exists():
-        log.warning("texture_bottom.png отсутствует")
+    if img_top is None:
+        log.warning("Текстура top отсутствует")
+    if img_bot is None:
+        log.warning("Текстура bot отсутствует")
     log.info("[+%dms] текстуры (%dms)", ms(), int((time.perf_counter() - t_tex) * 1000))
 
     # ── Шаг 3: GLB платы (промежуточный) ──
     t_glb = time.perf_counter()
     log.info("Собираем GLB платы...")
-    build_glb(prim_data, tex_top, tex_bot, side_color, board_glb_path)
+    build_glb(prim_data, img_top, img_bot, side_color, board_glb_path)
     log.info("[+%dms] GLB платы (%dms)", ms(), int((time.perf_counter() - t_glb) * 1000))
 
     # ── Шаг 4: компоненты (если указаны) ──

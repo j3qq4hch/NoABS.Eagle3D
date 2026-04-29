@@ -13,6 +13,8 @@ generatePCB.py
     pip install mapbox-earcut numpy   # рекомендуется: C++ бэкенд, в 50-100x быстрее
 """
 
+import io
+from concurrent.futures import ThreadPoolExecutor
 import xml.etree.ElementTree as ET
 import math
 import re
@@ -27,7 +29,7 @@ import time as _time
 from collections import defaultdict
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps, ImageStat
+from PIL import Image
 from _earcut import earcut as _earcut
 
 
@@ -52,23 +54,10 @@ def setup_logging():
 
 DEFAULT_LAYER     = "20"
 DEFAULT_THICKNESS = 1.6
-DEFAULT_COLORS = {
-    "substratecolor":  (120, 110,  70, 255),  # #786e46
-    "coppercolor":     (192, 192, 192, 255),  # #c0c0c0
-    "silkscreencolor": (255, 255, 255, 255),  # #ffffff
-    "soldermaskcolor": (  0, 140,  74, 255),  # #008C4A
-}
 ARC_SEGMENTS        = 64  # arc resolution for board outer outline
 CUTOUT_ARC_SEGMENTS = 16  # arc resolution for arcs within milling chains
 CIRCLE_CUTOUT_SEGMENTS = 32  # arc resolution for full-circle cutouts on layer 20
 HOLE_SEGMENTS       = 24  # arc resolution for circular drill holes
-
-_TEX_REQUIRED = [
-    "outline.png",
-    "top_copper.png", "bottom_copper.png",
-    "top_mask.png",   "bottom_mask.png",
-    "top_silk.png",   "bottom_silk.png",
-]
 
 
 # ══════════════════════════════════════════════
@@ -292,184 +281,6 @@ def get_colors(root) -> dict:
     return {**mfg_colors, **_get_description_colors(root)}
 
 
-# ══════════════════════════════════════════════
-#  Обработка текстур (PIL-only, без numpy/scipy)
-# ══════════════════════════════════════════════
-
-# Целевой размер изображения при floodfill — PIL floodfill реализован на Python,
-# поэтому на больших изображениях его выполняют на уменьшенной копии.
-_FILL_MIN_PX = 600
-
-# LUT-таблицы для point() — намного быстрее lambda, т.к. применяются на C уровне
-_LUT_LE128 = bytes(255 if i <= 128 else 0 for i in range(256))
-_LUT_GT128 = bytes(255 if i > 128 else 0 for i in range(256))
-_LUT_EQ128 = bytes(255 if i == 128 else 0 for i in range(256))
-_LUT_EQ255 = bytes(255 if i == 255 else 0 for i in range(256))
-_LUT_NE128 = bytes(255 if i != 128 else 0 for i in range(256))
-
-
-
-def _find_components_pil(mask_img: Image.Image):
-    """
-    Находит связные компоненты 255-пикселей в PIL L-изображении.
-    Возвращает список (count, mask_image) отсортированный по убыванию count.
-    """
-    w, h = mask_img.size
-    work = mask_img.copy()
-    components = []
-    lut_128 = bytes(255 if i == 128 else 0 for i in range(256))
-
-    while True:
-        raw = work.tobytes()
-        idx = raw.find(b'\xff')
-        if idx == -1:
-            break
-        seed = (idx % w, idx // w)
-
-        filled = work.copy()
-        ImageDraw.floodfill(filled, seed, 128)
-
-        comp = filled.point(lut_128)
-        count = int(ImageStat.Stat(comp).sum[0]) // 255
-        work = ImageChops.subtract(work, comp)
-
-        components.append((count, comp))
-
-    components.sort(key=lambda t: t[0], reverse=True)
-    return components
-
-
-def _tex_analyze_outline(outline_path: Path, threshold: int = 128):
-    """
-    Анализирует outline.png, возвращает PIL L-маски (0/255):
-      board_mask  — основной interior платы
-      hole_mask   — interior вырезов внутри платы
-      full_board  — всё что не снаружи (для bbox)
-      h, w        — размеры изображения
-
-    Floodfill выполняется на уменьшенной копии (до _FILL_MIN_PX px),
-    маски увеличиваются обратно через NEAREST — даёт 10-50x ускорение
-    на высоких DPI без заметного влияния на качество.
-    """
-    img = Image.open(outline_path).convert("L")
-    w, h = img.size
-
-    scale = max(1, max(w, h) // _FILL_MIN_PX)
-    sw, sh = (max(w // scale, 1), max(h // scale, 1)) if scale > 1 else (w, h)
-
-    lut_black = bytes(255 if i <= threshold else 0 for i in range(256))
-    is_black_full = img.point(lut_black)
-    if scale > 1:
-        # Eagle exports dark background + bright outline, so is_black has 255=background, 0=outline.
-        # PIL NEAREST resize can miss a 1-px outline entirely (sample points skip it).
-        # MinFilter at full resolution thickens the outline (expands 0-pixels) before downscale,
-        # guaranteeing every NEAREST block contains at least one outline pixel.
-        # scale//2+1 passes make the outline wide enough to survive the scale-factor block size.
-        dilated = is_black_full
-        for _ in range(scale // 2 + 1):
-            dilated = dilated.filter(ImageFilter.MinFilter(3))
-        is_black = dilated.resize((sw, sh), Image.NEAREST)
-        # Ensure exterior background (255) at image edges connects to padded border (also 255),
-        # even if MinFilter expansion reached the image boundary.
-        ImageDraw.Draw(is_black).rectangle([(0, 0), (sw - 1, sh - 1)], outline=255, width=1)
-    else:
-        is_black = is_black_full
-
-    padded = Image.new("L", (sw + 2, sh + 2), 255)
-    padded.paste(is_black, (1, 1))
-    ImageDraw.floodfill(padded, (0, 0), 128)
-    inner = padded.crop((1, 1, sw + 1, sh + 1))
-
-    interior   = inner.point(_LUT_EQ255)
-    full_board = inner.point(_LUT_NE128)
-
-    empty = Image.new("L", (sw, sh), 0)
-
-    if interior.getbbox() is None:
-        board_mask, hole_mask = empty, empty
-    else:
-        components = _find_components_pil(interior)
-        if not components:
-            board_mask, hole_mask = empty, empty
-        elif len(components) == 1:
-            board_mask = components[0][1]
-            hole_mask  = empty
-        else:
-            board_mask = components[0][1]
-            hole_mask  = empty.copy()
-            for _, comp in components[1:]:
-                hole_mask = ImageChops.add(hole_mask, comp)
-
-    if scale > 1:
-        board_mask = board_mask.resize((w, h), Image.NEAREST)
-        hole_mask  = hole_mask.resize((w, h), Image.NEAREST)
-        full_board = full_board.resize((w, h), Image.NEAREST)
-
-    return board_mask, hole_mask, full_board, h, w
-
-
-def _tex_board_bbox(full_board: Image.Image):
-    """Возвращает (r0, r1, c0, c1) bounding box ненулевых пикселей."""
-    bbox = full_board.getbbox()
-    if bbox is None:
-        w, h = full_board.size
-        return 0, h - 1, 0, w - 1
-    left, upper, right, lower = bbox
-    return upper, lower - 1, left, right - 1
-
-
-def _tex_load_gray(path: Path, h: int, w: int) -> Image.Image:
-    """Загружает PNG как оттенки серого PIL L-изображение нужного размера."""
-    img = Image.open(path).convert("L")
-    if img.size != (w, h):
-        img = img.resize((w, h), Image.NEAREST)
-    return img
-
-
-def _tex_make_rgba(mask: Image.Image, color, alpha=None) -> Image.Image:
-    """Создаёт RGBA PIL-изображение: color там где mask=255, прозрачно где 0."""
-    r, g, b, a = color
-    if alpha is not None:
-        a = alpha
-    w, h = mask.size
-    result  = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    colored = Image.new("RGBA", (w, h), (r, g, b, a))
-    result.paste(colored, mask=mask)
-    return result
-
-
-def _tex_composite(base: Image.Image, overlay: Image.Image) -> Image.Image:
-    return Image.alpha_composite(base, overlay)
-
-
-def _tex_extract_drill_holes(pads_gray: Image.Image) -> Image.Image:
-    """Возвращает PIL L-маску drill holes (чёрные области не связанные с границей)."""
-    w, h = pads_gray.size
-
-    scale = max(1, max(w, h) // _FILL_MIN_PX)
-    sw, sh = (max(w // scale, 1), max(h // scale, 1)) if scale > 1 else (w, h)
-
-    is_black_full = pads_gray.point(_LUT_LE128)
-    if scale > 1:
-        dilated = is_black_full
-        for _ in range(scale // 2 + 1):
-            dilated = dilated.filter(ImageFilter.MinFilter(3))
-        is_black = dilated.resize((sw, sh), Image.NEAREST)
-        ImageDraw.Draw(is_black).rectangle([(0, 0), (sw - 1, sh - 1)], outline=255, width=1)
-    else:
-        is_black = is_black_full
-
-    padded = Image.new("L", (sw + 2, sh + 2), 255)
-    padded.paste(is_black, (1, 1))
-    ImageDraw.floodfill(padded, (0, 0), 128)
-    inner = padded.crop((1, 1, sw + 1, sh + 1))
-    result = inner.point(_LUT_EQ255)
-
-    if scale > 1:
-        result = result.resize((w, h), Image.NEAREST)
-    return result
-
-
 def read_png_dpi(path: Path):
     """Читает DPI из метаданных PNG файла. Возвращает (dpi_x, dpi_y) или None."""
     try:
@@ -481,132 +292,6 @@ def read_png_dpi(path: Path):
         log.warning("Не удалось прочитать DPI из %s: %s", path.name, e)
     return None
 
-
-def process_textures(brd_path: Path, tex_dir: Path, output_dir: Path,
-                     colors_override: dict = None) -> bool:
-    """
-    Обрабатывает текстуры Eagle -> texture_top.png + texture_bottom.png.
-    Сохраняет результат в output_dir.
-    Возвращает True при успехе.
-
-    colors_override — полностью разрешённый dict цветов (substratecolor, coppercolor,
-    silkscreencolor, soldermaskcolor) в виде (R,G,B,A) кортежей. Если передан,
-    используется вместо чтения из BRD; иначе цвета читаются из BRD с DEFAULT_COLORS как fallback.
-    """
-    log.info("Обрабатываем текстуры из: %s", tex_dir)
-
-    if colors_override is not None:
-        colors = colors_override
-    else:
-        root = ET.parse(brd_path).getroot()
-        colors = {**DEFAULT_COLORS, **get_colors(root)}
-
-    substrate_color  = colors.get("substratecolor",  DEFAULT_COLORS["substratecolor"])
-    copper_color     = colors.get("coppercolor",      DEFAULT_COLORS["coppercolor"])
-    silkscreen_color = colors.get("silkscreencolor",  DEFAULT_COLORS["silkscreencolor"])
-    soldermask_color = colors.get("soldermaskcolor",  DEFAULT_COLORS["soldermaskcolor"])
-
-    log.debug("Цвета: substrate=%s, copper=%s, soldermask=%s",
-              substrate_color[:3], copper_color[:3], soldermask_color[:3])
-
-    missing = [f for f in _TEX_REQUIRED if not (tex_dir / f).exists()]
-    if missing:
-        log.warning("Отсутствуют файлы текстур: %s", ", ".join(missing))
-        return False
-
-    log.debug("Все обязательные текстуры найдены в %s", tex_dir)
-
-    dpi = None
-    for fname in _TEX_REQUIRED:
-        dpi = read_png_dpi(tex_dir / fname)
-        if dpi:
-            log.info("DPI текстур: %.1f x %.1f (из %s)", dpi[0], dpi[1], fname)
-            break
-    if dpi is None:
-        log.warning("DPI не найден ни в одном файле текстур")
-
-    board_mask, hole_mask, full_board, H, W = _tex_analyze_outline(tex_dir / "outline.png")
-    log.debug("Размер текстуры: %d x %d пикселей", W, H)
-
-    drill_holes = None
-    pads_path = tex_dir / "pads.png"
-    if pads_path.exists():
-        drill_holes = _tex_extract_drill_holes(_tex_load_gray(pads_path, H, W))
-        log.debug("pads.png найден, извлекаем drill holes")
-    else:
-        log.debug("pads.png не найден, drill holes пропускаем")
-
-    # board_white = board_mask без отверстий
-    board_white = board_mask.copy()
-    board_white = ImageChops.multiply(board_white, ImageOps.invert(hole_mask))
-    if drill_holes is not None:
-        board_white = ImageChops.multiply(board_white, ImageOps.invert(drill_holes))
-
-    r0, r1, c0, c1 = _tex_board_bbox(board_white)
-    crop_w, crop_h = c1 - c0 + 1, r1 - r0 + 1
-    log.info("Bounding box платы на текстуре: %d x %d пикселей", crop_w, crop_h)
-
-    if dpi:
-        phys_w_mm = crop_w / dpi[0] * 25.4
-        phys_h_mm = crop_h / dpi[1] * 25.4
-        log.info("Физический размер текстуры: %.2f x %.2f мм", phys_w_mm, phys_h_mm)
-
-    def load_m(fname):
-        return ImageChops.multiply(_tex_load_gray(tex_dir / fname, H, W), board_white)
-
-    def load_r(fname):
-        return _tex_load_gray(tex_dir / fname, H, W)
-
-    top_cu  = load_m("top_copper.png")
-    bot_cu  = load_m("bottom_copper.png")
-    top_si  = load_m("top_silk.png")
-    bot_si  = load_m("bottom_silk.png")
-    top_msk = load_r("top_mask.png")
-    bot_msk = load_r("bottom_mask.png")
-
-    def thresh(img):
-        return img.point(_LUT_GT128)
-
-    top_cu_t  = thresh(top_cu)
-    bot_cu_t  = thresh(bot_cu)
-    top_si_t  = thresh(top_si)
-    bot_si_t  = thresh(bot_si)
-    top_msk_t = thresh(top_msk)
-    bot_msk_t = thresh(bot_msk)
-
-    top_cu_l  = _tex_make_rgba(top_cu_t, copper_color, alpha=255)
-    bot_cu_l  = _tex_make_rgba(bot_cu_t, copper_color, alpha=255)
-
-    top_si_mask = ImageChops.multiply(top_si_t, ImageOps.invert(top_msk_t))
-    bot_si_mask = ImageChops.multiply(bot_si_t, ImageOps.invert(bot_msk_t))
-    top_si_l    = _tex_make_rgba(top_si_mask, silkscreen_color, alpha=255)
-    bot_si_l    = _tex_make_rgba(bot_si_mask, silkscreen_color, alpha=255)
-
-    top_msk_mask = ImageChops.multiply(ImageOps.invert(top_msk_t), board_white)
-    bot_msk_mask = ImageChops.multiply(ImageOps.invert(bot_msk_t), board_white)
-    top_msk_l    = _tex_make_rgba(top_msk_mask, soldermask_color, alpha=soldermask_color[3])
-    bot_msk_l    = _tex_make_rgba(bot_msk_mask, soldermask_color, alpha=soldermask_color[3])
-
-    outline_l = _tex_make_rgba(board_white, substrate_color, alpha=substrate_color[3])
-
-    def compose(layers):
-        result = layers[0].copy()
-        for layer in layers[1:]:
-            result = _tex_composite(result, layer)
-        return result
-
-    tex_top = compose([outline_l, top_cu_l, top_msk_l, top_si_l])
-    tex_bot = compose([outline_l, bot_cu_l, bot_msk_l, bot_si_l])
-
-    tex_top = tex_top.crop((c0, r0, c1 + 1, r1 + 1))
-    tex_bot = tex_bot.crop((c0, r0, c1 + 1, r1 + 1))
-
-    kw = {"dpi": dpi} if dpi else {}
-    output_dir.mkdir(parents=True, exist_ok=True)
-    tex_top.save(str(output_dir / "texture_top.png"),    **kw)
-    tex_bot.save(str(output_dir / "texture_bottom.png"), **kw)
-    log.info("Текстуры сохранены: texture_top.png + texture_bottom.png")
-    return True
 
 
 # ══════════════════════════════════════════════
@@ -974,12 +659,13 @@ def _pad4_json(data: bytes) -> bytes:
     return data + b' ' * (4 - r) if r else data
 
 
-def build_glb(primitives_data, tex_top_path: Path, tex_bot_path: Path,
+def build_glb(primitives_data, tex_top, tex_bot,
               side_color_rgba, output_path: Path):
     """
     Записывает GLB (плата без компонентов) в output_path.
     primitives_data: [(verts, norms, uvs, idx), ...] x 3 (top, bot, side)
     verts/norms/uvs — array.array('f') плоские, idx — array.array('I')
+    tex_top / tex_bot — Path, PIL Image, или None.
     """
     bin_data     = bytearray()
     buffer_views = []
@@ -1016,9 +702,36 @@ def build_glb(primitives_data, tex_top_path: Path, tex_bot_path: Path,
     samplers = [{"magFilter": 9729, "minFilter": 9987, "wrapS": 33071, "wrapT": 33071}]
     textures = []
 
-    def add_image(path: Path, name: str) -> int:
-        with open(path, "rb") as f:
-            png = f.read()
+    def _encode(source) -> bytes:
+        if isinstance(source, Path):
+            with open(source, "rb") as f:
+                return f.read()
+        buf = io.BytesIO()
+        source.save(buf, format="PNG", compress_level=1)
+        return buf.getvalue()
+
+    def _has_tex(t):
+        if t is None:
+            return False
+        return t.exists() if isinstance(t, Path) else True
+
+    # Encode PIL images to PNG bytes in parallel (zlib releases GIL → threads work)
+    pil_textures = [(k, v) for k, v in (("top", tex_top), ("bot", tex_bot))
+                    if v is not None and not isinstance(v, Path)]
+    if len(pil_textures) == 2:
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_top = ex.submit(_encode, tex_top)
+            f_bot = ex.submit(_encode, tex_bot)
+            tex_top = f_top.result()
+            tex_bot = f_bot.result()
+    else:
+        if tex_top is not None and not isinstance(tex_top, Path):
+            tex_top = _encode(tex_top)
+        if tex_bot is not None and not isinstance(tex_bot, Path):
+            tex_bot = _encode(tex_bot)
+
+    def add_image(source, name: str) -> int:
+        png = source if isinstance(source, bytes) else _encode(source)
         bv_img  = append_bin(png)
         img_idx = len(images)
         images.append({"bufferView": bv_img, "mimeType": "image/png", "name": name})
@@ -1043,20 +756,25 @@ def build_glb(primitives_data, tex_top_path: Path, tex_bot_path: Path,
                     "metallicFactor": 0.0, "roughnessFactor": 0.8},
                 "doubleSided": double_sided}
 
-    if tex_top_path.exists():
-        log.info("Текстура top: %s", tex_top_path.name)
-        ti = add_image(tex_top_path, "texture_top")
+    def _tex_label(t):
+        if isinstance(t, Path):  return t.name
+        if isinstance(t, bytes): return f"{len(t)} bytes"
+        return str(t.size)
+
+    if _has_tex(tex_top):
+        log.info("Текстура top: %s", _tex_label(tex_top))
+        ti = add_image(tex_top, "texture_top")
         materials.append(make_tex_material("mat_top", ti))
     else:
-        log.warning("texture_top.png не найдена, используем цвет подложки")
+        log.warning("Текстура top отсутствует, используем цвет подложки")
         materials.append(make_color_material("mat_top", side_color_rgba))
 
-    if tex_bot_path.exists():
-        log.info("Текстура bottom: %s", tex_bot_path.name)
-        bi = add_image(tex_bot_path, "texture_bottom")
+    if _has_tex(tex_bot):
+        log.info("Текстура bottom: %s", _tex_label(tex_bot))
+        bi = add_image(tex_bot, "texture_bottom")
         materials.append(make_tex_material("mat_bottom", bi))
     else:
-        log.warning("texture_bottom.png не найдена, используем цвет подложки")
+        log.warning("Текстура bottom отсутствует, используем цвет подложки")
         materials.append(make_color_material("mat_bottom", side_color_rgba))
 
     materials.append(make_color_material("mat_side", side_color_rgba, double_sided=True))
