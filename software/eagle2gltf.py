@@ -21,6 +21,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageChops
+from concurrent.futures import ThreadPoolExecutor
 
 # ── Импортируем building blocks из generatePCB и addComponents ──
 _HERE = Path(__file__).resolve().parent
@@ -76,6 +77,7 @@ def _crop_textures(img_top: Image.Image, img_bot: Image.Image):
              img_top.size[0], img_top.size[1], bbox[2] - bbox[0], bbox[3] - bbox[1])
 
     mask_bool = np.array(outline, dtype=bool)
+    y1, x1, y2, x2 = bbox[1], bbox[0], bbox[3], bbox[2]
 
     def clean_and_crop(img):
         arr = np.array(img)
@@ -84,9 +86,12 @@ def _crop_textures(img_top: Image.Image, img_bot: Image.Image):
         else:
             bg = int(0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2])
         arr[mask_bool] = bg
-        return Image.fromarray(arr).crop(bbox)
+        return Image.fromarray(arr[y1:y2, x1:x2])
 
-    return clean_and_crop(img_top), clean_and_crop(img_bot)
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_top = ex.submit(clean_and_crop, img_top)
+        f_bot = ex.submit(clean_and_crop, img_bot)
+        return f_top.result(), f_bot.result()
 
 
 from addComponents import (
@@ -104,7 +109,7 @@ log = logging.getLogger("eagle2gltf1")
 
 def process(brd_path, output_path, thickness_override, layer,
             glb_dir=None, tex_dir_override=None,
-            min_priority=0, open_after=False):
+            min_priority=0, open_after=False, merge=False):
     """
     Полный pipeline: BRD → GLB платы с текстурами и (опционально) компонентами.
 
@@ -197,7 +202,14 @@ def process(brd_path, output_path, thickness_override, layer,
         pre_top = tex_dir / "top_texture.bmp"
         pre_bot = tex_dir / "bottom_texture.bmp"
         if pre_top.exists() and pre_bot.exists():
-            img_top, img_bot = _crop_textures(Image.open(pre_top), Image.open(pre_bot))
+            def _load(p):
+                img = Image.open(p)
+                img.load()
+                return img
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                f_top = ex.submit(_load, pre_top)
+                f_bot = ex.submit(_load, pre_bot)
+                img_top, img_bot = _crop_textures(f_top.result(), f_bot.result())
             pre_top.unlink(missing_ok=True)
             pre_bot.unlink(missing_ok=True)
             log.info("Текстуры обработаны, BMP удалены")
@@ -228,6 +240,7 @@ def process(brd_path, output_path, thickness_override, layer,
             board_glb_path, placements, orientations,
             glb_index, thickness, output_path,
             min_priority=min_priority,
+            merge=merge,
         )
         log.info("[+%dms] компоненты (%dms)", ms(), int((time.perf_counter() - t_comp) * 1000))
     else:
@@ -264,6 +277,8 @@ def main():
                         help="Минимальный Priority3d компонента для включения в модель (default: 0 — все)")
     parser.add_argument("--textures", default=None,
                         help="Директория с PNG текстурами (default: <brd_stem>_textures/)")
+    parser.add_argument("--merge", action="store_true", default=False,
+                        help="Объединить компоненты без CONID в меши по материалам")
     parser.add_argument("--open", action="store_true", default=False,
                         help="Открыть результат в системном просмотрщике после генерации")
     parser.add_argument("--log", default=None,
@@ -287,6 +302,7 @@ def main():
 
     if args.log:
         logging.info("eagle2gltf1 started")
+        logging.info("cmd: %s", " ".join(sys.argv))
         logging.info("args: %s", vars(args))
 
     if not brd_path.exists():
@@ -299,7 +315,7 @@ def main():
 
     try:
         process(brd_path, output, args.thickness, args.layer, glb_dir, tex_dir_override,
-                min_priority=args.min_priority, open_after=args.open)
+                min_priority=args.min_priority, open_after=args.open, merge=args.merge)
     except Exception as e:
         import traceback
         log.error("FATAL ERROR: %s\n%s", e, traceback.format_exc())
