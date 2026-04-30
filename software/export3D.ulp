@@ -39,13 +39,14 @@ void main()
   string scripts_dir, settings_ini, ini_path, step2_path;
   string glb_dir, dpi_str, cmd, s, v;
   string mp_save, mc_save, fc_save, sc_save, dpi_save;
-  int min_priority, mask_choice, finish_choice, silk_choice, dpi, merge;
+  int min_priority, mask_choice, finish_choice, silk_choice, dpi, merge, photo_vias;
   int set_mode, open_mode, show_dialog, slen, ci, i, p, aa, rr, gg, bb;
   int r_mask, g_mask, b_mask, r_cu, g_cu, b_cu;
   int r_fin, g_fin, b_fin, r_silk, g_silk, b_silk;
-  int saved_pal[], saved_col[];
+  int saved_pal[], saved_col[], saved_fill[], saved_vis[];
   string mask_names[], finish_names[], silk_names[];
   int mask_color[], copper_color[], finish_color[], silk_color[];
+  real drill, via_r, via_w, vx, vy;
 
   if (!board) { dlgMessageBox("Error: no .brd file is open."); exit(1); }
 
@@ -84,6 +85,7 @@ void main()
   silk_choice   = 0;
   dpi           = 400;
   merge         = 0;
+  photo_vias    = 0;
 
   set_mode    = (argc == 2 && strupr(argv[1]) == "SET");
   open_mode   = (argc == 2 && strupr(argv[1]) == "OPEN");
@@ -99,6 +101,7 @@ void main()
     v = read_ini_value(settings_ini, "silk_choice");  if (strlen(v)) silk_choice   = strtol(v);
     v = read_ini_value(settings_ini, "dpi");          if (strlen(v)) dpi           = strtol(v);
     v = read_ini_value(settings_ini, "merge");        if (strlen(v)) merge         = strtol(v);
+    v = read_ini_value(settings_ini, "photo_vias");   if (strlen(v)) photo_vias    = strtol(v);
   }
 
   // ── Dialog ───────────────────────────────────────────────────────────────────
@@ -138,6 +141,10 @@ void main()
         }
         dlgCheckBox("Merge components by material", merge);
       }
+      dlgGroup("Texture options")
+      {
+        dlgCheckBox("Photorealistic vias", photo_vias);
+      }
       dlgHBoxLayout
       {
         dlgPushButton("+OK")     dlgAccept();
@@ -164,6 +171,7 @@ void main()
     printf("silk_choice=%s\n",    sc_save);
     printf("dpi=%s\n",            dpi_save);
     printf("merge=%d\n",          merge);
+    printf("photo_vias=%d\n",     photo_vias);
   }
 
   // ── Create working dirs and clear previous textures (single cmd call) ────────
@@ -205,7 +213,11 @@ void main()
   for (i = 0; i < 64; i++)
     saved_pal[i] = palette(i);
   board(B) {
-    B.layers(L) saved_col[L.number] = L.color;
+    B.layers(L) {
+      saved_col[L.number]  = L.color;
+      saved_fill[L.number] = L.fill;
+      saved_vis[L.number]  = L.visible;
+    }
   }
 
   // ── Eagle commands ────────────────────────────────────────────────────────────
@@ -222,6 +234,14 @@ void main()
   }
   cmd += "set Option.ViaLength 0;\n";
   cmd += "set PAD_NAMES OFF;\n";
+  cmd += "SET FILL_LAYER 1  1;\n";
+  cmd += "SET FILL_LAYER 16 1;\n";
+  cmd += "SET FILL_LAYER 17 1;\n";
+  cmd += "SET FILL_LAYER 18 1;\n";
+  cmd += "SET FILL_LAYER 19 1;\n";
+  cmd += "SET FILL_LAYER 20 1;\n";
+  cmd += "SET FILL_LAYER 21 1;\n";
+  cmd += "SET FILL_LAYER 22 1;\n";
   cmd += "SET FILL_LAYER 29 1;\n";
   cmd += "SET FILL_LAYER 30 1;\n";
 
@@ -230,6 +250,7 @@ void main()
   // Palette 17 = copper under mask
   // Palette 18 = silkscreen
   // Palette 19 = magenta marker for board outline (layer 20), used by Python to crop
+  // Palette 20 = via drill hole (dark), used only when photo_vias=1
   sprintf(s, "SET PALETTE 0  0x%02X%02X%02X%02X;\n", 0xFF, r_mask, g_mask, b_mask); cmd += s;
   sprintf(s, "SET PALETTE 16 0x%02X%02X%02X%02X;\n", 0xFF, r_fin,  g_fin,  b_fin);  cmd += s;
   sprintf(s, "SET PALETTE 17 0x%02X%02X%02X%02X;\n", 0xFF, r_cu,   g_cu,   b_cu);   cmd += s;
@@ -237,15 +258,49 @@ void main()
   cmd += "SET PALETTE 19 0xFFFF00FF;\n";
   cmd += "SET COLOR_LAYER 20 19;\n";
 
+  // ── Photorealistic vias: draw circles on layer 200 ───────────────────────────
+  if (photo_vias)
+  {
+    cmd += "SET PALETTE 20 0xFF000000;\n";
+    cmd += "SET COLOR_LAYER 200 20;\n";
+    cmd += "SET FILL_LAYER 200 1;\n";
+    board(B) {
+      B.signals(S) {
+        S.vias(V) {
+          drill = u2mm(V.drill);
+          via_r = drill / 4.0;
+          via_w = drill / 2.0;
+          vx    = u2mm(V.x);
+          vy    = u2mm(V.y);
+          cmd += "LAYER 200;\n";
+          sprintf(s, "CHANGE WIDTH %.4fmm;\n", via_w);
+          cmd += s;
+          sprintf(s, "CIRCLE (%.4fmm %.4fmm) (%.4fmm %.4fmm);\n",
+                  vx, vy, vx + via_r, vy);
+          cmd += s;
+        }
+      }
+    }
+  }
+
   // ── Top texture ───────────────────────────────────────────────────────────────
   cmd += "SET COLOR_LAYER 29 16;\n";
   cmd += "SET COLOR_LAYER 1  17;\n";
   cmd += "SET COLOR_LAYER 18 17;\n";
   cmd += "SET COLOR_LAYER 19 17;\n";
   cmd += "SET COLOR_LAYER 21 18;\n";
-  cmd += "SET Option.LayerSequence 20 21 29 1 18 19;\n";
-  cmd += "DISPLAY NONE;\n";
-  cmd += "DISPLAY 1 18 19 20 21 29;\n";
+  if (photo_vias)
+  {
+    cmd += "SET Option.LayerSequence 200 20 29 21 1 18 19;\n";
+    cmd += "DISPLAY NONE;\n";
+    cmd += "DISPLAY 200 1 18 19 20 29 21;\n";
+  }
+  else
+  {
+    cmd += "SET Option.LayerSequence 20 29 21 1 18 19;\n";
+    cmd += "DISPLAY NONE;\n";
+    cmd += "DISPLAY 1 18 19 20 29 21;\n";
+  }
   sprintf(s, "EXPORT IMAGE '%s' %s;\n", textures_dir + "top_texture.bmp", dpi_str);
   cmd += s;
 
@@ -255,11 +310,29 @@ void main()
   cmd += "SET COLOR_LAYER 17 17;\n";
   cmd += "SET COLOR_LAYER 18 17;\n";
   cmd += "SET COLOR_LAYER 22 18;\n";
-  cmd += "SET Option.LayerSequence 20 22 30 16 17 18;\n";
-  cmd += "DISPLAY NONE;\n";
-  cmd += "DISPLAY 16 17 18 20 22 30;\n";
+  if (photo_vias)
+  {
+    cmd += "SET Option.LayerSequence 200 20 30 22 16 17 18;\n";
+    cmd += "DISPLAY NONE;\n";
+    cmd += "DISPLAY 16 17 18 20 22 30 200;\n";
+  }
+  else
+  {
+    cmd += "SET Option.LayerSequence 20 30 22 16 17 18;\n";
+    cmd += "DISPLAY NONE;\n";
+    cmd += "DISPLAY 16 17 18 20 22 30;\n";
+  }
   sprintf(s, "EXPORT IMAGE '%s' %s;\n", textures_dir + "bottom_texture.bmp", dpi_str);
   cmd += s;
+
+  // ── Cleanup layer 200 (delete all via circles) ────────────────────────────────
+  if (photo_vias)
+  {
+    cmd += "DISPLAY NONE;\n";
+    cmd += "DISPLAY 200;\n";
+    cmd += "GROUP ALL;\n";
+    cmd += "DELETE (>0 0);\n";
+  }
 
   // ── Restore palette and layer colors ─────────────────────────────────────────
   for (i = 0; i < 64; i++) {
@@ -275,6 +348,8 @@ void main()
     B.layers(L) {
       sprintf(s, "SET COLOR_LAYER %d %d;\n", L.number, saved_col[L.number]);
       cmd += s;
+      sprintf(s, "SET FILL_LAYER %d %d;\n", L.number, saved_fill[L.number]);
+      cmd += s;
     }
   }
 
@@ -286,7 +361,15 @@ void main()
     cmd += "set Option.SignalNamesOnTraces 1;\n";
   }
   cmd += "set PAD_NAMES ON;\n";
-  cmd += "DISPLAY 20 17 18 1 21 23 25;\n";
+  {
+    string disp;
+    int li;
+    disp = "DISPLAY";
+    for (li = 1; li <= 255; li++)
+      if (saved_vis[li]) { sprintf(s, " %d", li); disp += s; }
+    disp += ";\n";
+    cmd += disp;
+  }
 
   // ── Launch step2 ──────────────────────────────────────────────────────────────
   step2_path = scripts_dir;
