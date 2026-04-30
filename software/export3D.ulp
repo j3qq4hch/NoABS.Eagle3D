@@ -39,7 +39,7 @@ void main()
   string scripts_dir, settings_ini, ini_path, step2_path;
   string glb_dir, dpi_str, cmd, s, v;
   string mp_save, mc_save, fc_save, sc_save, dpi_save;
-  int min_priority, mask_choice, finish_choice, silk_choice, dpi;
+  int min_priority, mask_choice, finish_choice, silk_choice, dpi, merge;
   int set_mode, open_mode, show_dialog, slen, ci, i, p, aa, rr, gg, bb;
   int r_mask, g_mask, b_mask, r_cu, g_cu, b_cu;
   int r_fin, g_fin, b_fin, r_silk, g_silk, b_silk;
@@ -83,6 +83,7 @@ void main()
   finish_choice = 0;
   silk_choice   = 0;
   dpi           = 400;
+  merge         = 0;
 
   set_mode    = (argc == 2 && strupr(argv[1]) == "SET");
   open_mode   = (argc == 2 && strupr(argv[1]) == "OPEN");
@@ -97,6 +98,7 @@ void main()
     v = read_ini_value(settings_ini, "finish_choice");if (strlen(v)) finish_choice = strtol(v);
     v = read_ini_value(settings_ini, "silk_choice");  if (strlen(v)) silk_choice   = strtol(v);
     v = read_ini_value(settings_ini, "dpi");          if (strlen(v)) dpi           = strtol(v);
+    v = read_ini_value(settings_ini, "merge");        if (strlen(v)) merge         = strtol(v);
   }
 
   // ── Dialog ───────────────────────────────────────────────────────────────────
@@ -134,6 +136,7 @@ void main()
           dlgIntEdit(min_priority, 0, 9999);
           dlgStretch(1);
         }
+        dlgCheckBox("Merge components by material", merge);
       }
       dlgHBoxLayout
       {
@@ -160,6 +163,7 @@ void main()
     printf("finish_choice=%s\n",  fc_save);
     printf("silk_choice=%s\n",    sc_save);
     printf("dpi=%s\n",            dpi_save);
+    printf("merge=%d\n",          merge);
   }
 
   // ── Create working dirs and clear previous textures (single cmd call) ────────
@@ -177,6 +181,7 @@ void main()
     printf("brd_stem=%s\n",      brd_stem);
     printf("glb_dir=%s\n",       glb_dir);
     printf("min_priority=%d\n",  min_priority);
+    printf("merge=%d\n",         merge);
   }
 
   // ── Extract RGB from presets ─────────────────────────────────────────────────

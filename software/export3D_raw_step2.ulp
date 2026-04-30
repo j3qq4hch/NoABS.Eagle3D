@@ -63,6 +63,7 @@ void main()
   string brd_stem      = read_ini_value(ini_path, "brd_stem");
   string glb_dir       = read_ini_value(ini_path, "glb_dir");
   string min_pri_str   = read_ini_value(ini_path, "min_priority");
+  string merge_str     = read_ini_value(ini_path, "merge");
   string tex_dir       = win_path(tmp_dir + brd_stem + "_textures");
 
   // scripts_dir — всегда папка самого step2.ulp
@@ -106,6 +107,8 @@ void main()
     py_cmd += " -c \"" + win_path(glb_dir) + "\"";
   if (strlen(min_pri_str) > 0 && strtol(min_pri_str) > 0)
     py_cmd += " --min-priority " + min_pri_str;
+  if (strlen(merge_str) > 0 && strtol(merge_str))
+    py_cmd += " --merge";
   if (open_mode)
     py_cmd += " --open";
 
