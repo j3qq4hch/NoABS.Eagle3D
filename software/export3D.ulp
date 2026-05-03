@@ -1,8 +1,8 @@
 #usage "Export board textures and generate 3D GLB model.\n\
 Usage:\n\
   RUN export3D.ulp       -- run silently if already configured, else show dialog\n\
-  RUN export3D.ulp SET   -- always show settings dialog\n\
-  RUN export3D.ulp OPEN  -- generate and open result in system viewer"
+  RUN export3D.ulp SET   -- show settings dialog and save, no export\n\
+  RUN export3D.ulp OPEN  -- open already-generated GLB in system viewer (no export)"
 
 string win_path(string s)
 {
@@ -83,12 +83,24 @@ void main()
   mask_choice   = 0;
   finish_choice = 0;
   silk_choice   = 0;
-  dpi           = 400;
-  merge         = 0;
-  photo_vias    = 0;
+  dpi           = 600;
+  merge         = 1;
+  photo_vias    = 1;
 
   set_mode    = (argc == 2 && strupr(argv[1]) == "SET");
   open_mode   = (argc == 2 && strupr(argv[1]) == "OPEN");
+
+  // ── OPEN mode: just open existing GLB, no export ─────────────────────────
+  if (open_mode)
+  {
+    string glb_path = board_dir + brd_stem + ".glb";
+    if (filesize(glb_path) > 0)
+      system("cmd.exe /c start \"\" \"" + win_path(glb_path) + "\"");
+    else
+      dlgMessageBox("3D model not generated yet, nothing to open.\nTry: RUN export3D.ulp");
+    exit(0);
+  }
+
   show_dialog = set_mode || (filesize(settings_ini) <= 0);
 
   // ── Load saved settings ────────────────────────────────────────────────────
@@ -154,7 +166,10 @@ void main()
       exit(0);
   }
 
-  if (dpi <= 0) dpi = 400;
+  if (dpi <= 0) dpi = 600;
+
+  // ── Ensure tmp_dir exists before writing settings ────────────────────────────
+  system("cmd.exe /c mkdir \"" + win_path(tmp_dir) + "\" 2>nul");
 
   // ── Save settings ────────────────────────────────────────────────────────────
   sprintf(mp_save,  "%d", min_priority);
@@ -174,9 +189,10 @@ void main()
     printf("photo_vias=%d\n",     photo_vias);
   }
 
-  // ── Create working dirs and clear previous textures (single cmd call) ────────
-  system("cmd.exe /c mkdir \"" + win_path(tmp_dir) + "\" 2>nul"
-       + " & mkdir \"" + win_path(textures_dir) + "\" 2>nul"
+  if (set_mode) exit(0);
+
+  // ── Create textures dir and clear previous textures ───────────────────────────
+  system("cmd.exe /c mkdir \"" + win_path(textures_dir) + "\" 2>nul"
        + " & del /f /q \"" + win_path(textures_dir) + "top_texture.bmp\" 2>nul"
        + " & del /f /q \"" + win_path(textures_dir) + "bottom_texture.bmp\" 2>nul");
 
@@ -232,6 +248,10 @@ void main()
     cmd += "set Option.SignalNamesOnPads 0;\n";
     cmd += "set Option.SignalNamesOnTraces 0;\n";
   }
+  else
+  {
+    cmd += "set Option.SignalNames = 0;\n";
+  }
   cmd += "set Option.ViaLength 0;\n";
   cmd += "set PAD_NAMES OFF;\n";
   cmd += "SET FILL_LAYER 1  1;\n";
@@ -283,24 +303,19 @@ void main()
     }
   }
 
+  // ── LayerSequence — set BEFORE any DISPLAY ───────────────────────────────────
+  cmd += "SET Option.LayerSequence 200t 20t 29t 21t 18 17 1-16 22b 30b 20b 200b;\n";
   // ── Top texture ───────────────────────────────────────────────────────────────
   cmd += "SET COLOR_LAYER 29 16;\n";
   cmd += "SET COLOR_LAYER 1  17;\n";
+  cmd += "SET COLOR_LAYER 17 17;\n";
   cmd += "SET COLOR_LAYER 18 17;\n";
-  cmd += "SET COLOR_LAYER 19 17;\n";
   cmd += "SET COLOR_LAYER 21 18;\n";
+  cmd += "DISPLAY NONE;\n";
   if (photo_vias)
-  {
-    cmd += "SET Option.LayerSequence 200 20 29 21 1 18 19;\n";
-    cmd += "DISPLAY NONE;\n";
-    cmd += "DISPLAY 200 1 18 19 20 29 21;\n";
-  }
+    cmd += "DISPLAY 20 21 29 1 17 18 200;\n";
   else
-  {
-    cmd += "SET Option.LayerSequence 20 29 21 1 18 19;\n";
-    cmd += "DISPLAY NONE;\n";
-    cmd += "DISPLAY 1 18 19 20 29 21;\n";
-  }
+    cmd += "DISPLAY 20 21 29 1 17 18;\n";
   sprintf(s, "EXPORT IMAGE '%s' %s;\n", textures_dir + "top_texture.bmp", dpi_str);
   cmd += s;
 
@@ -310,18 +325,12 @@ void main()
   cmd += "SET COLOR_LAYER 17 17;\n";
   cmd += "SET COLOR_LAYER 18 17;\n";
   cmd += "SET COLOR_LAYER 22 18;\n";
+  cmd += "DISPLAY NONE;\n";
   if (photo_vias)
-  {
-    cmd += "SET Option.LayerSequence 200 20 30 22 16 17 18;\n";
-    cmd += "DISPLAY NONE;\n";
     cmd += "DISPLAY 16 17 18 20 22 30 200;\n";
-  }
   else
-  {
-    cmd += "SET Option.LayerSequence 20 30 22 16 17 18;\n";
-    cmd += "DISPLAY NONE;\n";
     cmd += "DISPLAY 16 17 18 20 22 30;\n";
-  }
+
   sprintf(s, "EXPORT IMAGE '%s' %s;\n", textures_dir + "bottom_texture.bmp", dpi_str);
   cmd += s;
 
@@ -359,6 +368,10 @@ void main()
   {
     cmd += "set Option.SignalNamesOnPads 1;\n";
     cmd += "set Option.SignalNamesOnTraces 1;\n";
+  }
+  else
+  {
+    cmd += "set Option.SignalNames = 1;\n";
   }
   cmd += "set PAD_NAMES ON;\n";
   {
