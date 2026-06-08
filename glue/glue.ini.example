@@ -1,0 +1,4 @@
+[general]
+last_library = C:\path\to\EagleLibs\lbr\Connectors.lbr
+libfolder = C:\path\to\EagleLibs\lbr
+step_dir = C:\path\to\EagleLibs\reference\step

@@ -85,3 +85,9 @@ software/.vscode/
 /build_venv
 /NoABS_tmp
 /.claude
+/CropTest
+glue/glue.ini
+software/noabs.ini
+eaglerc.usr
+/eagle_bundle
+software/test_variants.ulp

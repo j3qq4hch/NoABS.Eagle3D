@@ -12,10 +12,15 @@ eagle2gltf1.py
 """
 
 import sys
+import os
 import shutil
 import argparse
 import logging
+import time
 from pathlib import Path
+
+from PIL import Image, ImageChops
+from concurrent.futures import ThreadPoolExecutor
 
 # ── Импортируем building blocks из generatePCB и addComponents ──
 _HERE = Path(__file__).resolve().parent
@@ -25,19 +30,63 @@ if str(_HERE) not in sys.path:
 from generatePCB import (
     load_brd,
     get_component_holes,
-    get_colors,
     get_thickness,
-    parse_color,
     extract_footprint_outline,
     chain_segments,
     classify_chains,
     build_board_mesh,
-    process_textures,
     build_glb,
     DEFAULT_LAYER,
     DEFAULT_THICKNESS,
-    DEFAULT_COLORS,
 )
+
+SUBSTRATE_COLOR = (120, 110, 70, 255)  # #786E46
+
+# Magenta (255, 0, 255) — цвет контура платы (layer 20), задаётся в ULP palette 19
+_OUTLINE_RGB = (255, 0, 255)
+_OUTLINE_TOL = 30
+
+
+def _outline_mask(img: Image.Image) -> Image.Image:
+    """L-маска: 255 там где пиксель совпадает с цветом контура (маджента)."""
+    r, g, b = img.convert("RGB").split()
+    r0, g0, b0 = _OUTLINE_RGB
+    tol = _OUTLINE_TOL
+    r_m = r.point(bytes(255 if abs(i - r0) <= tol else 0 for i in range(256)))
+    g_m = g.point(bytes(255 if abs(i - g0) <= tol else 0 for i in range(256)))
+    b_m = b.point(bytes(255 if abs(i - b0) <= tol else 0 for i in range(256)))
+    return ImageChops.multiply(ImageChops.multiply(r_m, g_m), b_m)
+
+
+def _crop_textures(img_top: Image.Image, img_bot: Image.Image):
+    """
+    Обрезать обе текстуры по одному bounding box контура платы.
+    Контур (layer 20) окрашен маджентой ULP-скриптом — он одинаков в обоих изображениях,
+    поэтому маску считаем один раз по top.
+    Magenta is replaced with the background color via PIL paste (mask = outline) —
+    pure PIL, no numpy (numpy's DLLs add ~10s of per-launch startup in the frozen exe).
+    """
+    outline = _outline_mask(img_top)
+    bbox = outline.getbbox()
+    if bbox is None:
+        log.warning("Контур платы (маджента) не найден в текстуре, обрезка пропущена")
+        return img_top, img_bot
+
+    bg_rgb = img_top.convert("RGB").getpixel((0, 0))
+    log.info("Обрезка текстур: %dx%d -> %dx%d",
+             img_top.size[0], img_top.size[1], bbox[2] - bbox[0], bbox[3] - bbox[1])
+
+    def clean_and_crop(img):
+        img = img.convert("RGB")
+        img.paste(bg_rgb, (0, 0, img.width, img.height), outline)  # outline pixels -> bg
+        return img.crop(bbox)
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_top = ex.submit(clean_and_crop, img_top)
+        f_bot = ex.submit(clean_and_crop, img_bot)
+        return f_top.result(), f_bot.result()
+
+
 from addComponents import (
     read_brd as read_brd_components,
     build_glb_index,
@@ -47,28 +96,66 @@ from addComponents import (
 log = logging.getLogger("eagle2gltf1")
 
 
+def _read_noabs_ini_components_dir():
+    """
+    Path to the GLB component model library — a workstation setting, not a
+    board setting. Stored in noabs.ini next to the exe (frozen) or the script
+    (dev). Flat key=value format; sections/comments (#, ;, [..]) are ignored.
+    Returns the path string or None.
+    """
+    base = Path(sys.executable).parent if getattr(sys, "frozen", False) else _HERE
+    # Search upward so it works regardless of layout (onefile: exe in software/;
+    # onedir: exe in software/eagle2gltf/, noabs.ini one level up).
+    ini = None
+    d = base
+    for _ in range(6):
+        if (d / "noabs.ini").exists():
+            ini = d / "noabs.ini"
+            break
+        if d.parent == d:
+            break
+        d = d.parent
+    if ini is None:
+        return None
+    try:
+        for raw in ini.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line[0] in "#;[":
+                continue
+            key, sep, val = line.partition("=")
+            if sep and key.strip().lower() == "components_dir":
+                val = val.strip().strip('"')
+                return val or None
+    except OSError as e:
+        log.warning("Failed to read noabs.ini: %s", e)
+    return None
+
+
 # ══════════════════════════════════════════════
 #  Основной поток (API идентичен оригинальному eagle2gltf.py)
 # ══════════════════════════════════════════════
 
 def process(brd_path, output_path, thickness_override, layer,
-            glb_dir=None, tex_dir_override=None, colors_override=None,
-            min_priority=0):
+            glb_dir=None, tex_dir_override=None,
+            min_priority=0, open_after=False, merge=False,
+            keep_artifacts=False):
     """
     Полный pipeline: BRD → GLB платы с текстурами и (опционально) компонентами.
 
     Аргументы:
-        brd_path          — путь к .brd файлу
-        output_path       — путь к выходному .glb
+        brd_path           — путь к .brd файлу
+        output_path        — путь к выходному .glb
         thickness_override — толщина платы в мм (None = из BRD)
-        layer             — слой контура платы (default: "20")
-        glb_dir           — директория с GLB моделями компонентов (None = без компонентов)
-        tex_dir_override  — директория с PNG текстурами (None = авто)
-        colors_override   — dict цветов из CLI (substratecolor и др.) в виде (R,G,B,A);
-                            перекрывает значения из BRD, DEFAULT_COLORS — fallback
+        layer              — слой контура платы (default: "20")
+        glb_dir            — директория с GLB моделями компонентов (None = без компонентов)
+        tex_dir_override   — директория с PNG текстурами (None = авто)
     """
     brd_path    = Path(brd_path)
     output_path = Path(output_path)
+
+    t0 = time.perf_counter()
+    def ms():
+        return int((time.perf_counter() - t0) * 1000)
 
     # Промежуточные файлы — в NoABS_tmp рядом с BRD
     work_dir       = brd_path.parent / "NoABS_tmp"
@@ -81,11 +168,7 @@ def process(brd_path, output_path, thickness_override, layer,
     # ── Шаг 1: геометрия платы ──
     root, wires, circles, holes = load_brd(brd_path, layer)
     comp_holes = get_component_holes(root)
-
-    # Приоритет цветов: CLI > BRD > DEFAULT_COLORS
-    brd_colors   = get_colors(root)
-    final_colors = {**DEFAULT_COLORS, **brd_colors, **(colors_override or {})}
-    side_color   = final_colors["substratecolor"]
+    side_color = SUBSTRATE_COLOR
     log.info("Цвет торца: RGBA%s", side_color)
 
     if thickness_override is not None:
@@ -128,6 +211,7 @@ def process(brd_path, output_path, thickness_override, layer,
              len(top_d[0]) // 3,  len(top_d[3])  // 3,
              len(bot_d[0]) // 3,  len(bot_d[3])  // 3,
              len(side_d[0]) // 3, len(side_d[3]) // 3)
+    log.info("[+%dms] контур + меш платы", ms())
 
     # ── Шаг 2: текстуры ──
     # По умолчанию ищем в <brd_dir>/<stem>_textures/ (оригинальное поведение eagle2gltf)
@@ -141,27 +225,46 @@ def process(brd_path, output_path, thickness_override, layer,
 
     log.info("Ищем текстуры в: %s", tex_dir)
 
-    tex_top = work_dir / "texture_top.png"
-    tex_bot = work_dir / "texture_bottom.png"
-
+    t_tex = time.perf_counter()
+    img_top = img_bot = None
     if tex_dir.exists():
-        ok = process_textures(brd_path, tex_dir, work_dir, colors_override=final_colors)
-        if not ok:
-            log.warning("Обработка текстур не удалась - GLB будет без текстур")
+        pre_top = tex_dir / "top_texture.bmp"
+        pre_bot = tex_dir / "bottom_texture.bmp"
+        if pre_top.exists() and pre_bot.exists():
+            def _load(p):
+                img = Image.open(p)
+                img.load()
+                return img
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                f_top = ex.submit(_load, pre_top)
+                f_bot = ex.submit(_load, pre_bot)
+                img_top, img_bot = _crop_textures(f_top.result(), f_bot.result())
+            if keep_artifacts:
+                log.info("Текстуры обработаны, BMP сохранены (--leave-artifacts)")
+            else:
+                pre_top.unlink(missing_ok=True)
+                pre_bot.unlink(missing_ok=True)
+                log.info("Текстуры обработаны, BMP удалены")
+        else:
+            log.warning("Текстуры Eagle не найдены в %s", tex_dir)
     else:
         log.warning("Директория текстур не найдена: %s - GLB без текстур", tex_dir)
 
-    if not tex_top.exists():
-        log.warning("texture_top.png отсутствует")
-    if not tex_bot.exists():
-        log.warning("texture_bottom.png отсутствует")
+    if img_top is None:
+        log.warning("Текстура top отсутствует")
+    if img_bot is None:
+        log.warning("Текстура bot отсутствует")
+    log.info("[+%dms] текстуры (%dms)", ms(), int((time.perf_counter() - t_tex) * 1000))
 
     # ── Шаг 3: GLB платы (промежуточный) ──
+    t_glb = time.perf_counter()
     log.info("Собираем GLB платы...")
-    build_glb(prim_data, tex_top, tex_bot, side_color, board_glb_path)
+    build_glb(prim_data, img_top, img_bot, side_color, board_glb_path)
+    log.info("[+%dms] GLB платы (%dms)", ms(), int((time.perf_counter() - t_glb) * 1000))
 
     # ── Шаг 4: компоненты (если указаны) ──
     if glb_dir is not None:
+        t_comp = time.perf_counter()
         log.info("Добавляем компоненты из: %s", glb_dir)
         placements, orientations, _ = read_brd_components(brd_path)
         glb_index = build_glb_index(Path(glb_dir))
@@ -169,7 +272,9 @@ def process(brd_path, output_path, thickness_override, layer,
             board_glb_path, placements, orientations,
             glb_index, thickness, output_path,
             min_priority=min_priority,
+            merge=merge,
         )
+        log.info("[+%dms] компоненты (%dms)", ms(), int((time.perf_counter() - t_comp) * 1000))
     else:
         # Без компонентов — копируем промежуточный GLB в output_path
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -177,8 +282,11 @@ def process(brd_path, output_path, thickness_override, layer,
             shutil.copy2(board_glb_path, output_path)
             log.debug("Скопирован GLB: %s -> %s", board_glb_path, output_path)
 
+    log.info("[+%dms] ИТОГО", ms())
     log.info("Готово: %s", output_path.resolve())
     print(str(output_path.resolve()))
+    if open_after:
+        os.startfile(str(output_path.resolve()))
 
 
 # ══════════════════════════════════════════════
@@ -201,14 +309,12 @@ def main():
                         help="Минимальный Priority3d компонента для включения в модель (default: 0 — все)")
     parser.add_argument("--textures", default=None,
                         help="Директория с PNG текстурами (default: <brd_stem>_textures/)")
-    parser.add_argument("--substrate-color", default=None, metavar="0xAARRGGBB",
-                        help="Цвет торца/подложки платы (default: 0xFF786E46)")
-    parser.add_argument("--copper-color", default=None, metavar="0xAARRGGBB",
-                        help="Цвет меди (default: 0xFFC0C0C0)")
-    parser.add_argument("--silkscreen-color", default=None, metavar="0xAARRGGBB",
-                        help="Цвет шелкографии (default: 0xFFFFFFFF)")
-    parser.add_argument("--soldermask-color", default=None, metavar="0xAARRGGBB",
-                        help="Цвет паяльной маски (default: 0xFF008C4A)")
+    parser.add_argument("--merge", action="store_true", default=False,
+                        help="Объединить компоненты без CONID в меши по материалам")
+    parser.add_argument("--open", action="store_true", default=False,
+                        help="Открыть результат в системном просмотрщике после генерации")
+    parser.add_argument("--leave-artifacts", action="store_true", default=False,
+                        help="Keep intermediate textures/GLB (debug); by default they are removed")
     parser.add_argument("--log", default=None,
                         help="Путь к лог-файлу (default: только stdout)")
     args = parser.parse_args()
@@ -230,6 +336,7 @@ def main():
 
     if args.log:
         logging.info("eagle2gltf1 started")
+        logging.info("cmd: %s", " ".join(sys.argv))
         logging.info("args: %s", vars(args))
 
     if not brd_path.exists():
@@ -237,25 +344,28 @@ def main():
         sys.exit(1)
 
     output           = Path(args.output).resolve() if args.output else brd_path.with_suffix(".glb")
-    glb_dir          = Path(args.components).resolve() if args.components else None
     tex_dir_override = Path(args.textures).resolve() if args.textures else None
 
-    cli_color_args = {
-        "substratecolor":  args.substrate_color,
-        "coppercolor":     args.copper_color,
-        "silkscreencolor": args.silkscreen_color,
-        "soldermaskcolor": args.soldermask_color,
-    }
-    colors_override = {
-        name: parse_color(val)
-        for name, val in cli_color_args.items()
-        if val is not None
-    }
+    # components_dir: CLI -c takes priority, otherwise fall back to noabs.ini (workstation setting)
+    if args.components:
+        glb_dir = Path(args.components).resolve()
+    else:
+        ini_dir = _read_noabs_ini_components_dir()
+        if ini_dir:
+            cand = Path(ini_dir)
+            if cand.exists():
+                glb_dir = cand.resolve()
+                log.info("components_dir from noabs.ini: %s", glb_dir)
+            else:
+                glb_dir = None
+                log.warning("components_dir from noabs.ini does not exist: %s", cand)
+        else:
+            glb_dir = None
 
     try:
         process(brd_path, output, args.thickness, args.layer, glb_dir, tex_dir_override,
-                colors_override=colors_override or None,
-                min_priority=args.min_priority)
+                min_priority=args.min_priority, open_after=args.open, merge=args.merge,
+                keep_artifacts=args.leave_artifacts)
     except Exception as e:
         import traceback
         log.error("FATAL ERROR: %s\n%s", e, traceback.format_exc())

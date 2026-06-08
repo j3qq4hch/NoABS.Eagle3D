@@ -83,7 +83,7 @@ def tessellate(step_path: Path, out_dir: Path) -> Path:
         f.write(tcl)
 
     try:
-        print(f"[tess] {step_path.name} → {out_path.name}")
+        print(f"[tess] {step_path.name} -> {out_path.name}")
         result = subprocess.run(
             [str(_DRAWEXE), "-f", str(tcl_file)],
             env=_build_env(),
@@ -102,7 +102,7 @@ def tessellate(step_path: Path, out_dir: Path) -> Path:
     if not out_path.exists():
         raise RuntimeError(f"Тесселяция не удалась: {step_path.name}")
 
-    print(f"[tess] ✓ {out_path.name} ({out_path.stat().st_size} bytes)")
+    print(f"[tess] OK {out_path.name} ({out_path.stat().st_size} bytes)")
     return out_path
 
 

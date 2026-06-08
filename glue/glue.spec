@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 GLUE_DIR = Path(SPECPATH)
 
@@ -17,8 +18,9 @@ a = Analysis(
     datas=[
         (str(GLUE_DIR / 'ui'),       'ui'),
         (str(GLUE_DIR / 'glue.ini'), '.'),
-    ],
-    hiddenimports=['webview', 'webview.platforms.winforms'],
+    ] + collect_data_files('pythonnet') + collect_data_files('clr_loader'),
+    hiddenimports=['webview', 'webview.platforms.winforms', 'clr', 'clr_loader']
+                + collect_submodules('clr_loader'),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

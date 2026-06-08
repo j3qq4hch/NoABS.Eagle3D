@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 import math
 import re
@@ -21,20 +22,55 @@ import argparse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from step_merge import add_step_color, merge_step_assembly
+from step_merge import add_step_color  # merge_step_assembly replaced by OCCT/XDE assembly
 
 
 DEFAULT_LAYER     = "20"
 DEFAULT_THICKNESS = 1.6
 
-if getattr(sys, 'frozen', False):
-    # COLLECT layout: release_artifacts/tools/eagle2step/eagle2step.exe
-    # drawexe_bundle is at:  release_artifacts/drawexe_bundle/
-    BUNDLE_DIR = Path(sys.executable).parent.parent.parent / "drawexe_bundle"
-else:
-    # source layout: software/eagle2step.py, drawexe_bundle/ at repo root
-    BUNDLE_DIR = Path(__file__).resolve().parent.parent / "drawexe_bundle"
+def _find_up(name, start, levels=6):
+    """Walk up from `start` looking for a child named `name`; return it or None.
+    Makes layout (onefile flat vs onedir subfolder, dev vs frozen) irrelevant."""
+    d = Path(start)
+    for _ in range(levels):
+        if (d / name).exists():
+            return d / name
+        if d.parent == d:
+            break
+        d = d.parent
+    return None
+
+# Find drawexe_bundle by searching upward from the exe/script — robust to whether
+# the exe sits in software/ (onefile) or software/eagle2step/ (onedir).
+_BASE      = Path(sys.executable) if getattr(sys, 'frozen', False) else Path(__file__).resolve()
+BUNDLE_DIR = _find_up("drawexe_bundle", _BASE.parent) or (_BASE.parent.parent / "drawexe_bundle")
 _DRAWEXE   = BUNDLE_DIR / "bin" / "DRAWEXE.exe"
+
+
+def _read_noabs_ini_step_dir():
+    """
+    Path to the STEP component model library — a workstation setting, not a
+    board setting. Stored in noabs.ini next to the exe (frozen) or the script
+    (dev), under key `step_components_dir`. Flat key=value; sections/comments
+    (#, ;, [..]) ignored. Returns the path string or None.
+    """
+    base = Path(sys.executable).parent if getattr(sys, "frozen", False) \
+        else Path(__file__).resolve().parent
+    ini = _find_up("noabs.ini", base)   # upward search: layout-robust
+    if ini is None:
+        return None
+    try:
+        for raw in ini.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line[0] in "#;[":
+                continue
+            key, sep, val = line.partition("=")
+            if sep and key.strip().lower() == "step_components_dir":
+                val = val.strip().strip('"')
+                return val or None
+    except OSError:
+        pass
+    return None
 
 
 # ══════════════════════════════════════════════
@@ -481,7 +517,9 @@ def _chain_to_tcl(chain, tag: str, lines: list) -> str:
             x, y = seg["x2"], seg["y2"]
         else:
             x, y = seg["x1"], seg["y1"]
-        lines.append(f"vertex v_{tag}_{i} {x:.6f} {y:.6f} 0")
+        # 10 decimals: 6 (1e-6 mm) exceeds OCCT Precision::Confusion (1e-7 mm),
+        # which breaks wire sewing at arc junctions on "messy" outline coordinates.
+        lines.append(f"vertex v_{tag}_{i} {x:.10f} {y:.10f} 0")
 
     edge_names = []
     for i, (seg, flipped) in enumerate(chain):
@@ -512,7 +550,7 @@ def _chain_to_tcl(chain, tag: str, lines: list) -> str:
                 u2 = math.atan2(y1 - cy, x1 - cx)
                 if u2 <= u1:
                     u2 += 2 * math.pi
-            lines.append(f"circle {eid}_c {cx:.6f} {cy:.6f} 0  0 0 1  {r:.6f}")
+            lines.append(f"circle {eid}_c {cx:.10f} {cy:.10f} 0  0 0 1  {r:.10f}")
             lines.append(f"mkedge {eid} {eid}_c {u1:.10f} {u2:.10f}")
 
         edge_names.append(eid)
@@ -538,7 +576,8 @@ def make_board_step(outer_chain, cutout_chains, layer_circles,
     debug=False: запускает DRAWEXE напрямую, без сохранения TCL/BAT.
     debug=True:  сохраняет TCL + BAT рядом с out_path, DRAWEXE не запускает.
     """
-    lines = ["pload OCAFKERNEL XDE MODELING"]
+    lines = ["pload OCAFKERNEL XDE MODELING",
+             "param write.surfacecurve.mode 0"]  # smaller STEP, no pcurves (regenerated on import)
     t = thickness
 
     # Основное тело платы
@@ -689,14 +728,22 @@ def read_brd_placements(brd_path):
         lib_name = el.get("library", "")
         pkg_name = el.get("package", "")
         angle, mirror = parse_rot(el.get("rot", ""))
+        priority = 0
+        for attr in el.findall("attribute"):
+            if attr.get("name", "").lower() == "priority3d":
+                try:
+                    priority = int(attr.get("value", "0"))
+                except (ValueError, TypeError):
+                    pass
         placements.append({
-            "name":    el.get("name", ""),
-            "library": lib_name,
-            "package": pkg_name,
-            "x":       float(el.get("x", 0)),
-            "y":       float(el.get("y", 0)),
-            "angle":   angle,
-            "mirror":  mirror,
+            "name":     el.get("name", ""),
+            "library":  lib_name,
+            "package":  pkg_name,
+            "x":        float(el.get("x", 0)),
+            "y":        float(el.get("y", 0)),
+            "angle":    angle,
+            "mirror":   mirror,
+            "priority": priority,
         })
 
     return placements, orientations
@@ -725,6 +772,78 @@ def compute_step_placement(p: dict, o: dict, thickness: float):
     return M
 
 
+def _decompose_placement(M):
+    """
+    Decompose a 4x4 placement matrix into DRAWEXE primitives:
+      (mirror, axis, angle_deg, translation)
+    A rigid placement is rotation+translation (det +1). A mirrored (bottom-side)
+    placement has det -1; we factor out a reflection about Z so the remaining
+    rotation is proper, and the caller emits a `tmirror` about Z first.
+    """
+    L = [[M[i][j] for j in range(3)] for i in range(3)]
+    t = [M[i][3] for i in range(3)]
+    det = (L[0][0]*(L[1][1]*L[2][2]-L[1][2]*L[2][1])
+          -L[0][1]*(L[1][0]*L[2][2]-L[1][2]*L[2][0])
+          +L[0][2]*(L[1][0]*L[2][1]-L[1][1]*L[2][0]))
+    mirror = det < 0
+    R = [[L[i][0], L[i][1], -L[i][2]] for i in range(3)] if mirror else L
+
+    tr = R[0][0] + R[1][1] + R[2][2]
+    ang = math.degrees(math.acos(max(-1.0, min(1.0, (tr - 1.0) / 2.0))))
+    rx, ry, rz = R[2][1]-R[1][2], R[0][2]-R[2][0], R[1][0]-R[0][1]
+    n = math.sqrt(rx*rx + ry*ry + rz*rz)
+    if n > 1e-9:
+        ax = (rx/n, ry/n, rz/n)
+    elif ang > 90.0:
+        # ~180°: axis from R = 2*a*a^T - I
+        d = [max(0.0, (R[i][i] + 1.0) / 2.0) for i in range(3)]
+        i = max(range(3), key=lambda k: d[k])
+        ai = math.sqrt(d[i]) or 1.0
+        ax = tuple((math.sqrt(d[j]) if j == i else (R[i][j]+R[j][i])/(4.0*ai)) for j in range(3))
+    else:
+        ax = (0.0, 0.0, 1.0)
+    return mirror, ax, ang, t
+
+
+def _parse_first_step_color(path: Path):
+    """First COLOUR_RGB (r,g,b) in a STEP file, or None."""
+    try:
+        txt = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = re.search(r"COLOUR_RGB\s*\(\s*'[^']*'\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)", txt)
+    return tuple(float(x) for x in m.groups()) if m else None
+
+
+def _tcl_str(s: str) -> str:
+    """Escape a string for use inside a TCL double-quoted literal."""
+    for a, b in (("\\", "\\\\"), ('"', '\\"'), ("$", "\\$"), ("[", "\\["), ("]", "\\]")):
+        s = s.replace(a, b)
+    return s
+
+
+# Solder-mask presets — must match the colours in export3D.ulp's dialog.
+_NOABS_MASK_RGB = {
+    "green":  (0x1A, 0x7C, 0x0F),
+    "blue":   (0x1A, 0x18, 0xBF),
+    "red":    (0x9F, 0x18, 0x0F),
+    "black":  (0x1A, 0x18, 0x0F),
+    "purple": (0x9F, 0x18, 0x73),
+    "white":  (0xE2, 0xE0, 0xD7),
+}
+
+
+def _noabs_mask_color(root):
+    """Board colour from the global NOABS_MASK attribute (name -> 0..1 RGB), or None."""
+    for attrs in root.iter("attributes"):          # <board><attributes> section
+        for a in attrs.findall("attribute"):
+            if a.get("name", "").upper() == "NOABS_MASK":
+                rgb = _NOABS_MASK_RGB.get(a.get("value", "").strip().lower())
+                if rgb:
+                    return tuple(c / 255.0 for c in rgb)
+    return None
+
+
 def make_assembly_step(
     brd_path: Path,
     board_step: Path,
@@ -732,39 +851,118 @@ def make_assembly_step(
     thickness: float,
     out_path: Path,
     debug: bool = False,
+    min_priority: int = 0,
+    board_color=None,
 ) -> None:
     placements, orientations = read_brd_placements(brd_path)
+
+    # priority3d filter: keep components with priority3d >= min_priority.
+    # Default min_priority=0 keeps everything EXCEPT parts explicitly set to a
+    # negative priority3d (e.g. -1) — a deliberate "never put in 3D" marker.
+    before = len(placements)
+    excluded = sorted(p["name"] for p in placements if p["priority"] < min_priority)
+    placements = [p for p in placements if p["priority"] >= min_priority]
+    if excluded:
+        print(f"  Priority3d >= {min_priority}: kept {len(placements)} of {before}; excluded: {', '.join(excluded)}")
+
     step_index = build_step_index(step_dir)
 
-    instances = []
-    placed = 0
-    skipped = 0
+    # Build a proper STEP assembly via OCCT/DRAWEXE (XDE):
+    #   - board is the assembly root ("PCB")
+    #   - each unique package is read once (ReadStep, preserving its full per-solid
+    #     colors) and captured as the newest free shape
+    #   - every placement is a located instance (copy + XAddComponent) referencing it
+    # This yields a real AP214 assembly tree (no origin duplicates, colors intact),
+    # unlike the old text merger which double-realized assembly-structured components.
+    board_posix = Path(board_step).resolve().as_posix()
+    out_posix   = Path(out_path).resolve().as_posix()
+    # Root must be a NEUTRAL (colorless) assembly, not the board itself: if the
+    # board is the root, XSetColor on it lands on the root and cascades to every
+    # child that lacks its own color (e.g. uncolored LED models would turn blue).
+    # So wrap the board in a compound -> that compound is the colorless root, and
+    # the board is just its first (colored) component.
+    tcl = [
+        "pload ALL",
+        # Do not write surface pcurves: ~1.85x smaller files, geometry identical
+        # (pcurves are regenerated on import by every CAD). Without this an OCCT
+        # round-trip de-shares vertices and nearly doubles point count.
+        "param write.surfacecurve.mode 0",
+        "XNewDoc D",
+        f'stepread "{board_posix}" bb *',
+        "compound bb_1 ec",
+        "set L0 [XAddShape D ec 1]",
+        'SetName D $L0 "PCB"',
+    ]
+    # stepread carries geometry only — re-apply the board (soldermask) color.
+    if board_color:
+        tcl.append(f"XSetColor D bb_1 {board_color[0]:.4f} {board_color[1]:.4f} {board_color[2]:.4f}")
 
-    missing_packages = set()
+    proto: dict[str, str] = {}   # package.lower() -> prototype var basename
+    placed = skipped = 0
+    missing_packages: set[str] = set()
+    k = inst = 0
+
     for p in placements:
-        key = (p["library"], p["package"])
         step_file = step_index.get(p["package"].lower())
         if step_file is None:
             skipped += 1
             missing_packages.add(p["package"])
             continue
 
-        o = orientations.get(key, _DEFAULT_ORIENT)
+        key = p["package"].lower()
+        if key not in proto:
+            pv = f"pr{k}"; k += 1
+            # A component STEP may have MANY top-level roots (some files store the
+            # body and every pin as separate products, e.g. SOIC18-300MIL = 19 roots).
+            # Capture ALL roots this ReadStep adds (delta of free shapes, newest last)
+            # and remember the list. NOTE: do NOT wrap them in a compound and copy that
+            # — copying a compound loses TShape sharing, so the originals get written at
+            # the origin as duplicates. Instead each root is instanced directly below.
+            tcl.append(f"set _n0 [llength [XGetFreeShapes D {pv}b]]")
+            tcl.append(f'ReadStep D "{step_file.resolve().as_posix()}"')
+            tcl.append(f"set _af [XGetFreeShapes D {pv}a]")
+            tcl.append(f"set roots_{pv} [lrange $_af $_n0 end]")
+            proto[key] = pv
+
+        pv = proto[key]
+        o = orientations.get((p["library"], p["package"]), _DEFAULT_ORIENT)
         M = compute_step_placement(p, o, thickness)
+        mirror, ax, ang, t = _decompose_placement(M)
+
+        iv = f"c{inst}"; inst += 1
+        # Instance every root of this package with the same placement transform, so
+        # multi-root parts (body + separate pins) stay together and nothing is dropped.
+        xf = []
+        if mirror:
+            xf.append(f"  tmirror {iv}_$_j 0 0 0 0 0 1")
+        if abs(ang) > 1e-6:
+            xf.append(f"  trotate {iv}_$_j 0 0 0 {ax[0]:.8f} {ax[1]:.8f} {ax[2]:.8f} {ang:.6f}")
+        xf.append(f"  ttranslate {iv}_$_j {t[0]:.6f} {t[1]:.6f} {t[2]:.6f}")
+        tcl.append(f"set _j 0")
+        tcl.append(f"foreach _r $roots_{pv} {{")
+        tcl.append(f"  copy $_r {iv}_$_j")
+        tcl.extend(xf)
+        tcl.append(f"  XAddComponent D $L0 {iv}_$_j")
+        tcl.append(f"  incr _j")
+        tcl.append(f"}}")
 
         if debug:
-            t = [M[i][3] for i in range(3)]
-            print(
-                f"  {p['name']:12s} {p['package']:20s}"
-                f"  pos=({t[0]:.2f},{t[1]:.2f},{t[2]:.2f})"
-                f"  rot={p['angle']}°  mirror={p['mirror']}"
-                f"  -> {step_file.name}"
-            )
-
-        instances.append((step_file, M))
+            print(f"  {p['name']:12s} {p['package']:20s} mirror={p['mirror']} -> {step_file.name}")
         placed += 1
 
-    merge_step_assembly(board_step, instances, out_path)
+    if placed == 0:
+        # No components: an XDE assembly with only the board doesn't carry the board
+        # color through WriteStep (XSetColor needs at least one XAddComponent to take).
+        # The board_step already has its color (add_step_color), so just use it as-is.
+        Path(out_path).write_bytes(Path(board_step).read_bytes())
+        print(f"  Размещено: 0 — STEP только плата (цвет из board_step)")
+        if missing_packages:
+            print(f"  Нет STEP для пакетов: {', '.join(sorted(missing_packages))}")
+        return
+
+    tcl += ["XUpdateAssemblies D", f'WriteStep D "{out_posix}"', "exit"]
+    _run_drawexe("\n".join(tcl), verbose=False)
+
     print(f"  Размещено: {placed}, пропущено (нет STEP): {skipped}")
     if missing_packages:
         print(f"  Нет STEP для пакетов: {', '.join(sorted(missing_packages))}")
@@ -775,7 +973,10 @@ def make_assembly_step(
 # ══════════════════════════════════════════════
 
 def process(brd_path, step_path, thickness_override, layer,
-            step_dir=None, assembly_path=None, debug=False):
+            step_dir=None, assembly_path=None, debug=False, min_priority=0):
+    t0 = time.perf_counter()
+    def _ms():
+        return int((time.perf_counter() - t0) * 1000)
     print(f"Читаем: {brd_path}")
     root, wires, circles, holes = extract_board_elements(brd_path, layer)
     print(f"  wire: {len(wires)}, circle: {len(circles)}, hole: {len(holes)}")
@@ -817,7 +1018,8 @@ def process(brd_path, step_path, thickness_override, layer,
         total = sum(len(ch) for ch in open_chains)
         print(f"  !  {total} сегментов незамкнуты — пропускаются")
 
-    soldermask_color = parse_soldermask_color(root)
+    # Prefer the NoABS dialog choice (NOABS_MASK); fall back to the board's own mask color.
+    soldermask_color = _noabs_mask_color(root) or parse_soldermask_color(root)
     if soldermask_color:
         r, g, b = soldermask_color
         print(f"  цвет маски: RGB({r:.3f}, {g:.3f}, {b:.3f})")
@@ -825,16 +1027,23 @@ def process(brd_path, step_path, thickness_override, layer,
         print(f"  цвет маски: не найден, плата будет серой")
 
     print(f"Строим 3D модель платы через DRAWEXE...")
+    t_board = time.perf_counter()
     make_board_step(
         outer_chain, cutout_chains, circles,
         holes, comp_holes, thickness, step_path, color=soldermask_color, debug=debug
     )
+    print(f"[+{_ms()}ms] плата ({int((time.perf_counter() - t_board) * 1000)}ms)")
 
     if step_dir is not None:
         if assembly_path is None:
             assembly_path = brd_path.with_name(brd_path.stem + "_assembly.step")
         print(f"Добавляем компоненты из {step_dir}...")
-        make_assembly_step(brd_path, step_path, step_dir, thickness, assembly_path, debug=debug)
+        t_comp = time.perf_counter()
+        make_assembly_step(brd_path, step_path, step_dir, thickness, assembly_path,
+                           debug=debug, min_priority=min_priority, board_color=soldermask_color)
+        print(f"[+{_ms()}ms] компоненты ({int((time.perf_counter() - t_comp) * 1000)}ms)")
+
+    print(f"[+{_ms()}ms] ИТОГО")
 
 
 # ══════════════════════════════════════════════
@@ -855,7 +1064,11 @@ def main():
     parser.add_argument("--step-dir", "-c", default=None,
                         help="Папка со STEP-файлами компонентов -> строит сборку")
     parser.add_argument("--assembly-output", "-a", default=None,
-                        help="Выходной файл сборки (default: <имя>_assembly.step)")
+                        help="Выходной файл сборки (default: <имя>.step)")
+    parser.add_argument("--min-priority", type=int, default=0,
+                        help="Minimum Priority3d for a component to be included (default: 0 — all)")
+    parser.add_argument("--leave-artifacts", action="store_true", default=False,
+                        help="Keep the intermediate board-only STEP (debug); removed by default")
     parser.add_argument("--debug", action="store_true",
                         help="Сохранить TCL/BAT вместо прямого запуска DRAWEXE")
     args = parser.parse_args()
@@ -865,16 +1078,44 @@ def main():
         print(f"Файл не найден: {brd_path}")
         sys.exit(1)
 
-    step_path = Path(args.output) if args.output else brd_path.with_suffix(".step")
-    step_dir  = Path(args.step_dir).resolve() if args.step_dir else None
-    assembly_path = Path(args.assembly_output) if args.assembly_output else None
+    output = Path(args.output) if args.output else brd_path.with_suffix(".step")
 
+    # step components dir: CLI -c takes priority, otherwise noabs.ini (workstation setting)
+    if args.step_dir:
+        step_dir = Path(args.step_dir).resolve()
+    else:
+        ini_dir = _read_noabs_ini_step_dir()
+        step_dir = Path(ini_dir).resolve() if ini_dir else None
+        if step_dir is not None:
+            print(f"step_components_dir from noabs.ini: {step_dir}")
     if step_dir is not None and not step_dir.is_dir():
-        print(f"Папка компонентов не найдена: {step_dir}")
-        sys.exit(1)
+        print(f"STEP components dir not found: {step_dir}")
+        step_dir = None
 
-    process(brd_path, step_path, args.thickness, args.layer,
-            step_dir, assembly_path, debug=args.debug)
+    if step_dir is not None:
+        # Single result file = board + components. The board-only STEP is just an
+        # intermediate (assembly input); keep it in NoABS_tmp, drop it afterwards.
+        assembly_path = Path(args.assembly_output) if args.assembly_output else output
+        work = brd_path.parent / "NoABS_tmp"
+        work.mkdir(parents=True, exist_ok=True)
+        board_tmp = work / (brd_path.stem + "_board.step")
+        process(brd_path, board_tmp, args.thickness, args.layer,
+                step_dir, assembly_path, debug=args.debug, min_priority=args.min_priority)
+        if not args.leave_artifacts:
+            try:
+                board_tmp.unlink()
+            except OSError:
+                pass
+            try:
+                work.rmdir()  # remove NoABS_tmp only if now empty
+            except OSError:
+                pass
+        print(str(Path(assembly_path).resolve()))
+    else:
+        # No component library: the bare board IS the single output.
+        process(brd_path, output, args.thickness, args.layer,
+                None, None, debug=args.debug, min_priority=args.min_priority)
+        print(str(output.resolve()))
 
 
 if __name__ == "__main__":

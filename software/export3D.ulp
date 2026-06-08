@@ -1,0 +1,182 @@
+#usage "NoABS.Eagle3D — export board textures and generate a 3D GLB model.\n\
+Settings live in the board's global NOABS_* attributes (human-readable).\n\
+Usage:\n\
+  RUN export3D.ulp        -- first run: show settings dialog and store them, then stop.\n\
+                             once configured: generate the 3D model.\n\
+  RUN export3D.ulp STEP   -- generate a STEP model (board + components) instead of GLB.\n\
+  RUN export3D.ulp SET    -- show the settings dialog and store them (no generation).\n\
+  RUN export3D.ulp OPEN   -- open the already-generated GLB in the system viewer.\n\
+  RUN export3D.ulp LOG    -- open the last eagle2gltf log (needs 'Leave artifacts')."
+
+string win_path(string s)
+{
+  string result = s;
+  int i;
+  for (i = 0; result[i]; i++)
+    if (result[i] == '/') result[i] = '\\';
+  return result;
+}
+
+string fwd_path(string s)
+{
+  string result = s;
+  int i;
+  for (i = 0; result[i]; i++)
+    if (result[i] == '\\') result[i] = '/';
+  return result;
+}
+
+// Read a global board attribute by name; "" if absent.
+string get_attr(string nm)
+{
+  string r = "";
+  board(B) B.attributes(A) if (A.name == nm) r = A.value;
+  return r;
+}
+
+// Integer attribute with default.
+int attr_int(string nm, int def)
+{
+  string v = get_attr(nm);
+  if (strlen(v) == 0) return def;
+  return strtol(v);
+}
+
+void main()
+{
+  if (!board) { dlgMessageBox("Error: no .brd file is open."); exit(1); }
+
+  // ── Board paths ─────────────────────────────────────────────────────────────
+  string board_dir, brd_stem, brd_full, tmp_dir;
+  board(B)
+  {
+    board_dir = filedir(B.name);
+    brd_stem  = filesetext(filename(B.name), "");
+    brd_full  = B.name;
+    tmp_dir   = board_dir + "NoABS_tmp/";
+  }
+  string scripts_dir = fwd_path(filedir(argv[0]));   // .../software/
+  int sl = strlen(scripts_dir);
+  if (sl > 0 && scripts_dir[sl-1] == '/') scripts_dir[sl-1] = '\0';
+
+  int set_mode  = (argc == 2 && strupr(argv[1]) == "SET");
+  int open_mode = (argc == 2 && strupr(argv[1]) == "OPEN");
+  int log_mode  = (argc == 2 && strupr(argv[1]) == "LOG");
+  int step_mode = (argc == 2 && strupr(argv[1]) == "STEP");
+
+  // ── OPEN: open existing GLB, no export ───────────────────────────────────────
+  if (open_mode)
+  {
+    string glb_path = board_dir + brd_stem + ".glb";
+    if (filesize(glb_path) > 0)
+      system("cmd.exe /c start \"\" \"" + win_path(glb_path) + "\"");
+    else
+      dlgMessageBox("3D model not generated yet.\nRun: RUN export3D.ulp");
+    exit(0);
+  }
+
+  // ── LOG: open last python log (only present with 'Leave artifacts') ───────────
+  if (log_mode)
+  {
+    string log_path = tmp_dir + "eagle2gltf.log";
+    if (filesize(log_path) > 0)
+      system("cmd.exe /c start \"\" \"" + win_path(log_path) + "\"");
+    else
+      dlgMessageBox("No log found.\nEnable 'Leave artifacts' in the dialog and re-run.");
+    exit(0);
+  }
+
+  // ── STEP: no textures needed — save board and run eagle2step directly ─────────
+  if (step_mode)
+  {
+    string stepgen_path = scripts_dir + "/export3D_raw_stepgen.ulp";
+    exit("WRITE;\nRUN '" + stepgen_path + "';\n");
+  }
+
+  // ── Color presets (must match export3D_raw_step1.ulp) ─────────────────────────
+  string mask_names[], finish_names[], silk_names[];
+  mask_names[0] = "Green";   mask_names[1] = "Blue";   mask_names[2] = "Red";
+  mask_names[3] = "Black";   mask_names[4] = "Purple"; mask_names[5] = "White";
+  finish_names[0] = "ENIG (gold)"; finish_names[1] = "HASL (tin)";
+  silk_names[0] = "White"; silk_names[1] = "Black";
+
+  // ── Current settings from attributes (for dialog prefill) ─────────────────────
+  int i;
+  int mask_choice = 0, finish_choice = 0, silk_choice = 0;
+  string av;
+  av = get_attr("NOABS_MASK");   for (i = 0; i < 6; i++) if (mask_names[i]   == av) mask_choice   = i;
+  av = get_attr("NOABS_FINISH"); for (i = 0; i < 2; i++) if (finish_names[i] == av) finish_choice = i;
+  av = get_attr("NOABS_SILK");   for (i = 0; i < 2; i++) if (silk_names[i]   == av) silk_choice   = i;
+  int dpi          = attr_int("NOABS_DPI", 600);
+  int photo_vias   = attr_int("NOABS_PHOTO_VIAS", 1);
+  int min_priority = attr_int("NOABS_MIN_PRIORITY3D", 0);
+  int merge        = attr_int("NOABS_MERGE", 1);
+  int leave        = attr_int("NOABS_LEAVE_ARTIFACTS", 0);
+
+  // Board is "configured" once NOABS_DPI has been written.
+  int configured  = (strlen(get_attr("NOABS_DPI")) > 0);
+  int show_dialog = set_mode || !configured;
+
+  // ── CONFIGURE: dialog → write attributes → stop ───────────────────────────────
+  if (show_dialog)
+  {
+    if (dlgDialog("NoABS.Eagle3D — Settings")
+    {
+      dlgGroup("Solder mask")   { dlgComboBox(mask_names,   mask_choice);   }
+      dlgGroup("Pad finish")    { dlgComboBox(finish_names, finish_choice); }
+      dlgGroup("Silkscreen")    { dlgComboBox(silk_names,   silk_choice);   }
+      dlgHBoxLayout { dlgLabel("Texture DPI:");   dlgIntEdit(dpi, 72, 2400);          dlgStretch(1); }
+      dlgHBoxLayout { dlgLabel("Min Priority3d:"); dlgIntEdit(min_priority, 0, 9999); dlgStretch(1); }
+      dlgCheckBox("Photorealistic vias", photo_vias);
+      dlgCheckBox("Merge components by material", merge);
+      dlgCheckBox("Leave 3D model generation artifacts", leave);
+      dlgLabel("<b>This only saves settings — the model is NOT generated yet.</b><br>"
+             + "Run export3D.ulp again (without arguments) to generate the 3D model.");
+      dlgHBoxLayout
+      {
+        dlgPushButton("+OK")     dlgAccept();
+        dlgPushButton("-Cancel") dlgReject();
+      }
+    } != 1)
+      exit(0);
+
+    if (dpi <= 0) dpi = 600;
+
+    string cmd, s;
+    cmd  = "ATTRIBUTE * NOABS_MASK '"   + mask_names[mask_choice]     + "';\n";
+    cmd += "ATTRIBUTE * NOABS_FINISH '" + finish_names[finish_choice] + "';\n";
+    cmd += "ATTRIBUTE * NOABS_SILK '"   + silk_names[silk_choice]     + "';\n";
+    sprintf(s, "ATTRIBUTE * NOABS_DPI '%d';\n",            dpi);          cmd += s;
+    sprintf(s, "ATTRIBUTE * NOABS_PHOTO_VIAS '%d';\n",     photo_vias);   cmd += s;
+    sprintf(s, "ATTRIBUTE * NOABS_MIN_PRIORITY3D '%d';\n", min_priority); cmd += s;
+    sprintf(s, "ATTRIBUTE * NOABS_MERGE '%d';\n",          merge);        cmd += s;
+    sprintf(s, "ATTRIBUTE * NOABS_LEAVE_ARTIFACTS '%d';\n", leave);       cmd += s;
+    cmd += "WRITE;\n";
+    exit(cmd);   // configure-and-stop; run again to generate
+  }
+
+  // ── GENERATE ──────────────────────────────────────────────────────────────────
+  // Rudimentary timing probe (1s resolution): fresh timing.txt at launch; step1/step2
+  // append their stage timestamps. Lives in NoABS_tmp (visible when artifacts are kept).
+  // Deltas: step1−launch = Eagle 7 startup (spawn path); step2−step1 = texture prep.
+  system("cmd.exe /c mkdir \"" + win_path(tmp_dir) + "\" 2>nul");
+  int t_now = time();
+  output(win_path(tmp_dir + "timing.txt"), "wt")
+    printf("%d  %02d:%02d:%02d  export3D launch\n",
+           t_now, t2hour(t_now), t2minute(t_now), t2second(t_now));
+
+  string step1_path = scripts_dir + "/export3D_raw_step1.ulp";
+
+  if (EAGLE_VERSION < 8)
+  {
+    // Eagle 7: no render bug — run the worker in-place in this very session.
+    exit("RUN '" + step1_path + "' INPLACE;\n");
+  }
+  else
+  {
+    // Eagle 9: save the board, then hand off to the spawner (which launches
+    // bundled headless Eagle 7 to render textures, avoiding the v9 render bug).
+    string spawn_path = scripts_dir + "/export3D_raw_spawn.ulp";
+    exit("WRITE;\nRUN '" + spawn_path + "';\n");
+  }
+}
