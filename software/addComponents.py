@@ -330,11 +330,15 @@ def embed_components(board_glb_path: Path, placements: list, orientations: dict,
 
     min_priority — минимальный Priority3d для включения компонента в модель.
     """
-    if min_priority > 0:
-        before = len(placements)
-        placements = [p for p in placements if p["priority"] >= min_priority]
-        log.info("Фильтр по Priority3d >= %d: %d из %d компонентов",
-                 min_priority, len(placements), before)
+    # priority3d filter: keep components with priority3d >= min_priority.
+    # Default min_priority=0 keeps everything EXCEPT parts explicitly set to a
+    # negative priority3d (e.g. -1) — a deliberate "never put in 3D" marker.
+    before = len(placements)
+    excluded = sorted(p["name"] for p in placements if p["priority"] < min_priority)
+    placements = [p for p in placements if p["priority"] >= min_priority]
+    if excluded:
+        log.info("Priority3d >= %d: kept %d of %d; excluded: %s",
+                 min_priority, len(placements), before, ", ".join(excluded))
 
     if merge:
         merge_list = [p for p in placements if not p.get("conid")]

@@ -1,0 +1,72 @@
+#usage "NoABS.Eagle3D spawner (Eagle 9 path).\n\
+Launches bundled headless Eagle 7 (eaglecon) to render textures and run the\n\
+full generation chain, working around the Eagle 9 layer-render bug.\n\
+Invoked by export3D.ulp; not meant to be run directly."
+
+string win_path(string s)
+{
+  string result = s;
+  int i;
+  for (i = 0; result[i]; i++)
+    if (result[i] == '/') result[i] = '\\';
+  return result;
+}
+
+string fwd_path(string s)
+{
+  string result = s;
+  int i;
+  for (i = 0; result[i]; i++)
+    if (result[i] == '\\') result[i] = '/';
+  return result;
+}
+
+string strip_slash(string s)
+{
+  int n = strlen(s);
+  if (n > 0 && (s[n-1] == '/' || s[n-1] == '\\')) s[n-1] = '\0';
+  return s;
+}
+
+void main()
+{
+  if (!board) { dlgMessageBox("export3D_raw_spawn: no .brd file is open."); exit(1); }
+
+  string board_dir, brd_full;
+  board(B) { board_dir = filedir(B.name); brd_full = B.name; }
+
+  // scripts_dir = .../software/ ; bundle is a sibling: .../eagle_bundle/
+  string scripts_dir = fwd_path(filedir(argv[0]));
+  string repo_dir    = fwd_path(filedir(strip_slash(scripts_dir)));
+  string bundle_dir  = repo_dir + "eagle_bundle/";
+
+  string eaglecon = win_path(bundle_dir + "bin/eaglecon.exe");
+  string eaglerc  = win_path(bundle_dir + "eaglerc.usr");
+  string step1    = fwd_path(strip_slash(scripts_dir)) + "/export3D_raw_step1.ulp";
+
+  if (filesize(eaglecon) <= 0)
+  {
+    dlgMessageBox("Bundled Eagle 7 not found:\n" + eaglecon
+                + "\n\nThe eagle_bundle folder must sit next to 'software'.");
+    exit(1);
+  }
+
+  // Write a .bat next to the board (NOT under NoABS_tmp, which step2 may delete).
+  string bat_path = win_path(board_dir + "noabs_spawn.bat");
+  output(bat_path, "wt")
+  {
+    printf("@echo off\r\n");
+    printf("\"%s\" -U \"%s\" -C \"RUN '%s' HEADLESS; SET CONFIRM NO; QUIT\" \"%s\"\r\n",
+           eaglecon, eaglerc, step1, win_path(brd_full));
+    printf("exit /b %%errorlevel%%\r\n");
+  }
+
+  int ret = system("cmd.exe /c \"" + bat_path + "\"");
+
+  // Remove the spawner .bat
+  system("cmd.exe /c del /f /q \"" + bat_path + "\" 2>nul");
+
+  if (ret != 0)
+    dlgMessageBox("3D generation failed (exit code " + ret + ").\n"
+                + "Enable 'Leave artifacts' and check NoABS_tmp/eagle2gltf.log.");
+}

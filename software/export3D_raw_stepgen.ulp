@@ -1,7 +1,8 @@
-#usage "NoABS.Eagle3D Python launcher (step 2 of 2).\n\
-Runs eagle2gltf (exe or python) after textures are exported by step1.\n\
-Reads NOABS_MERGE / NOABS_MIN_PRIORITY3D / NOABS_LEAVE_ARTIFACTS from board attributes.\n\
-components_dir is taken by the Python side from noabs.ini (not passed here)."
+#usage "NoABS.Eagle3D STEP launcher.\n\
+Runs eagle2step (exe or python) to produce a single <name>.step (board + components).\n\
+No texture rendering is needed for STEP. Reads NOABS_MIN_PRIORITY3D / NOABS_LEAVE_ARTIFACTS\n\
+from board attributes; step_components_dir is taken by the Python side from noabs.ini.\n\
+Invoked by export3D.ulp; not meant to be run directly."
 
 string win_path(string s)
 {
@@ -30,31 +31,21 @@ int attr_int(string nm, int def)
 
 void main()
 {
-  if (!board) { dlgMessageBox("export3D_raw_step2: no .brd file is open."); exit(1); }
+  if (!board) { dlgMessageBox("export3D_raw_stepgen: no .brd file is open."); exit(1); }
 
   // ── Board paths ─────────────────────────────────────────────────────────────
-  string board_dir, brd_stem, brd_full, tmp_dir, tex_dir;
+  string board_dir, brd_full, tmp_dir;
   board(B)
   {
     board_dir = filedir(B.name);
-    brd_stem  = filesetext(filename(B.name), "");
     brd_full  = B.name;
     tmp_dir   = board_dir + "NoABS_tmp/";
-    tex_dir   = tmp_dir + brd_stem + "_textures";
   }
-
-  // Timing probe: textures are done, about to launch Python (step2−step1 = texture prep).
-  int t_now = time();
-  output(win_path(tmp_dir + "timing.txt"), "at")
-    printf("%d  %02d:%02d:%02d  step2 (textures done)\n",
-           t_now, t2hour(t_now), t2minute(t_now), t2second(t_now));
-
   string scripts_dir = filedir(argv[0]);
 
   // ── Settings from board attributes ───────────────────────────────────────────
-  int merge    = attr_int("NOABS_MERGE", 1);
-  int min_pri  = attr_int("NOABS_MIN_PRIORITY3D", 0);
-  int leave    = attr_int("NOABS_LEAVE_ARTIFACTS", 0);
+  int min_pri = attr_int("NOABS_MIN_PRIORITY3D", 0);
+  int leave   = attr_int("NOABS_LEAVE_ARTIFACTS", 0);
 
   // ── Resolve runner: prefer bundled exe, fall back to python + script ──────────
   string sd = scripts_dir;
@@ -62,9 +53,9 @@ void main()
   if (sdlen > 0 && (sd[sdlen-1] == '/' || sd[sdlen-1] == '\\'))
     sd[sdlen-1] = '\0';
   // onedir puts the exe in a subfolder; onefile/dev keep it flat. Check both, else python.
-  string exe_sub  = win_path(sd + "/eagle2gltf/eagle2gltf.exe");
-  string exe_flat = win_path(sd + "/eagle2gltf.exe");
-  string py_path  = win_path(sd + "/eagle2gltf.py");
+  string exe_sub  = win_path(sd + "/eagle2step/eagle2step.exe");
+  string exe_flat = win_path(sd + "/eagle2step.exe");
+  string py_path  = win_path(sd + "/eagle2step.py");
 
   string runner;
   if (filesize(exe_sub) > 0)
@@ -74,20 +65,20 @@ void main()
   else
     runner = "python \"" + py_path + "\"";
 
-  string log_path = win_path(tmp_dir + "eagle2gltf.log");
+  // NoABS_tmp must exist before the .bat redirects its log there.
+  system("cmd.exe /c mkdir \"" + win_path(tmp_dir) + "\" 2>nul");
+  string log_path = win_path(tmp_dir + "eagle2step.log");
 
   // ── Build command line ────────────────────────────────────────────────────────
   string py_cmd, s;
   py_cmd  = runner;
   py_cmd += " \"" + win_path(brd_full) + "\"";
-  py_cmd += " --textures \"" + win_path(tex_dir) + "\"";
-  py_cmd += " --log \"" + log_path + "\"";
   if (min_pri > 0) { sprintf(s, " --min-priority %d", min_pri); py_cmd += s; }
-  if (merge) py_cmd += " --merge";
   if (leave) py_cmd += " --leave-artifacts";
+  py_cmd += " > \"" + log_path + "\" 2>&1";
 
   // ── Run via a .bat (reliable PATH handling); propagate exit code ──────────────
-  string bat_path = win_path(tmp_dir + "run_eagle2gltf.bat");
+  string bat_path = win_path(tmp_dir + "run_eagle2step.bat");
   output(bat_path, "wt")
   {
     printf("@echo off\r\n");
@@ -99,4 +90,7 @@ void main()
   // ── Cleanup: drop NoABS_tmp on success unless artifacts are requested ──────────
   if (ret == 0 && !leave)
     system("cmd.exe /c rmdir /s /q \"" + win_path(tmp_dir) + "\" 2>nul");
+  else if (ret != 0)
+    dlgMessageBox("STEP generation failed (exit code " + ret + ").\n"
+                + "See " + log_path);
 }

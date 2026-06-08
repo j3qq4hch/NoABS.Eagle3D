@@ -19,7 +19,6 @@ import logging
 import time
 from pathlib import Path
 
-import numpy as np
 from PIL import Image, ImageChops
 from concurrent.futures import ThreadPoolExecutor
 
@@ -64,7 +63,8 @@ def _crop_textures(img_top: Image.Image, img_bot: Image.Image):
     Обрезать обе текстуры по одному bounding box контура платы.
     Контур (layer 20) окрашен маджентой ULP-скриптом — он одинаков в обоих изображениях,
     поэтому маску считаем один раз по top.
-    Маджента заменяется фоновым цветом через numpy (sparse write по пикселям контура).
+    Magenta is replaced with the background color via PIL paste (mask = outline) —
+    pure PIL, no numpy (numpy's DLLs add ~10s of per-launch startup in the frozen exe).
     """
     outline = _outline_mask(img_top)
     bbox = outline.getbbox()
@@ -76,17 +76,10 @@ def _crop_textures(img_top: Image.Image, img_bot: Image.Image):
     log.info("Обрезка текстур: %dx%d -> %dx%d",
              img_top.size[0], img_top.size[1], bbox[2] - bbox[0], bbox[3] - bbox[1])
 
-    mask_bool = np.array(outline, dtype=bool)
-    y1, x1, y2, x2 = bbox[1], bbox[0], bbox[3], bbox[2]
-
     def clean_and_crop(img):
-        arr = np.array(img)
-        if arr.ndim == 3:
-            bg = bg_rgb + (255,) * (arr.shape[2] - 3)
-        else:
-            bg = int(0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2])
-        arr[mask_bool] = bg
-        return Image.fromarray(arr[y1:y2, x1:x2])
+        img = img.convert("RGB")
+        img.paste(bg_rgb, (0, 0, img.width, img.height), outline)  # outline pixels -> bg
+        return img.crop(bbox)
 
     with ThreadPoolExecutor(max_workers=2) as ex:
         f_top = ex.submit(clean_and_crop, img_top)
@@ -103,13 +96,49 @@ from addComponents import (
 log = logging.getLogger("eagle2gltf1")
 
 
+def _read_noabs_ini_components_dir():
+    """
+    Path to the GLB component model library — a workstation setting, not a
+    board setting. Stored in noabs.ini next to the exe (frozen) or the script
+    (dev). Flat key=value format; sections/comments (#, ;, [..]) are ignored.
+    Returns the path string or None.
+    """
+    base = Path(sys.executable).parent if getattr(sys, "frozen", False) else _HERE
+    # Search upward so it works regardless of layout (onefile: exe in software/;
+    # onedir: exe in software/eagle2gltf/, noabs.ini one level up).
+    ini = None
+    d = base
+    for _ in range(6):
+        if (d / "noabs.ini").exists():
+            ini = d / "noabs.ini"
+            break
+        if d.parent == d:
+            break
+        d = d.parent
+    if ini is None:
+        return None
+    try:
+        for raw in ini.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line[0] in "#;[":
+                continue
+            key, sep, val = line.partition("=")
+            if sep and key.strip().lower() == "components_dir":
+                val = val.strip().strip('"')
+                return val or None
+    except OSError as e:
+        log.warning("Failed to read noabs.ini: %s", e)
+    return None
+
+
 # ══════════════════════════════════════════════
 #  Основной поток (API идентичен оригинальному eagle2gltf.py)
 # ══════════════════════════════════════════════
 
 def process(brd_path, output_path, thickness_override, layer,
             glb_dir=None, tex_dir_override=None,
-            min_priority=0, open_after=False, merge=False):
+            min_priority=0, open_after=False, merge=False,
+            keep_artifacts=False):
     """
     Полный pipeline: BRD → GLB платы с текстурами и (опционально) компонентами.
 
@@ -210,9 +239,12 @@ def process(brd_path, output_path, thickness_override, layer,
                 f_top = ex.submit(_load, pre_top)
                 f_bot = ex.submit(_load, pre_bot)
                 img_top, img_bot = _crop_textures(f_top.result(), f_bot.result())
-            pre_top.unlink(missing_ok=True)
-            pre_bot.unlink(missing_ok=True)
-            log.info("Текстуры обработаны, BMP удалены")
+            if keep_artifacts:
+                log.info("Текстуры обработаны, BMP сохранены (--leave-artifacts)")
+            else:
+                pre_top.unlink(missing_ok=True)
+                pre_bot.unlink(missing_ok=True)
+                log.info("Текстуры обработаны, BMP удалены")
         else:
             log.warning("Текстуры Eagle не найдены в %s", tex_dir)
     else:
@@ -281,6 +313,8 @@ def main():
                         help="Объединить компоненты без CONID в меши по материалам")
     parser.add_argument("--open", action="store_true", default=False,
                         help="Открыть результат в системном просмотрщике после генерации")
+    parser.add_argument("--leave-artifacts", action="store_true", default=False,
+                        help="Keep intermediate textures/GLB (debug); by default they are removed")
     parser.add_argument("--log", default=None,
                         help="Путь к лог-файлу (default: только stdout)")
     args = parser.parse_args()
@@ -310,12 +344,28 @@ def main():
         sys.exit(1)
 
     output           = Path(args.output).resolve() if args.output else brd_path.with_suffix(".glb")
-    glb_dir          = Path(args.components).resolve() if args.components else None
     tex_dir_override = Path(args.textures).resolve() if args.textures else None
+
+    # components_dir: CLI -c takes priority, otherwise fall back to noabs.ini (workstation setting)
+    if args.components:
+        glb_dir = Path(args.components).resolve()
+    else:
+        ini_dir = _read_noabs_ini_components_dir()
+        if ini_dir:
+            cand = Path(ini_dir)
+            if cand.exists():
+                glb_dir = cand.resolve()
+                log.info("components_dir from noabs.ini: %s", glb_dir)
+            else:
+                glb_dir = None
+                log.warning("components_dir from noabs.ini does not exist: %s", cand)
+        else:
+            glb_dir = None
 
     try:
         process(brd_path, output, args.thickness, args.layer, glb_dir, tex_dir_override,
-                min_priority=args.min_priority, open_after=args.open, merge=args.merge)
+                min_priority=args.min_priority, open_after=args.open, merge=args.merge,
+                keep_artifacts=args.leave_artifacts)
     except Exception as e:
         import traceback
         log.error("FATAL ERROR: %s\n%s", e, traceback.format_exc())

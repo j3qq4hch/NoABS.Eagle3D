@@ -22,6 +22,26 @@ def _probe_mapbox_earcut():
     Returns a dict with keys 'strategy' ('memoryview'|'numpy') and 'rings' ('cumulative'|'counts'),
     or None if mapbox-earcut is not usable.
     """
+    # Frozen build: the subprocess probe can't run (sys.executable is the frozen exe →
+    # it just re-launches the app and blocks the full timeout). Probe IN-PROCESS instead.
+    # mapbox returns an ndarray, so numpy is needed at call time anyway → numpy strategy.
+    if getattr(_sys, "frozen", False):
+        try:
+            import numpy as _np
+            from mapbox_earcut import triangulate_float64 as _mbc
+            coords = [0, 0, 1, 0, 1, 1, 0, 1, 0.3, 0.3, 0.7, 0.3, 0.5, 0.7]
+            verts = _np.array(coords, dtype=_np.float64).reshape(-1, 2)
+            for label, rdata in (("cumulative", [4, 7]), ("counts", [4, 3])):
+                try:
+                    out = _mbc(verts, _np.array(rdata, dtype=_np.uint32))
+                    if len(out) > 0 and len(out) % 3 == 0:
+                        return {"strategy": "numpy", "rings": label}
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return None
+
     probe = r"""
 import sys, array as _a
 from mapbox_earcut import triangulate_float64 as mbc

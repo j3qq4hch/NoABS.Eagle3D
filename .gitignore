@@ -87,4 +87,7 @@ software/.vscode/
 /.claude
 /CropTest
 glue/glue.ini
+software/noabs.ini
 eaglerc.usr
+/eagle_bundle
+software/test_variants.ulp

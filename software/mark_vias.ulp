@@ -1,0 +1,29 @@
+#usage "Draw a circle on layer 200 over every via: radius=drill/4, width=drill/2"
+
+string cmd;
+string s;
+real   drill, radius, width, x, y;
+
+void do_mark_vias() {
+    board(B) {
+        B.signals(S) {
+            S.vias(V) {
+                drill  = u2mm(V.drill);
+                radius = drill / 4.0;
+                width  = drill / 2.0;
+                x      = u2mm(V.x);
+                y      = u2mm(V.y);
+
+                cmd += "LAYER 200;\n";
+                sprintf(s, "CHANGE WIDTH %.4fmm;\n", width);
+                cmd += s;
+                sprintf(s, "CIRCLE (%.4fmm %.4fmm) (%.4fmm %.4fmm);\n",
+                        x, y, x + radius, y);
+                cmd += s;
+            }
+        }
+    }
+}
+
+do_mark_vias();
+exit(cmd);

@@ -1,0 +1,11 @@
+# NoABS.Eagle3D — workstation setting (not a board setting).
+# Copy this file to noabs.ini next to the exe and adjust the paths below.
+# Path to the GLB component model library.
+# File names must match Eagle footprint names (case-insensitive).
+# The -c/--components CLI argument overrides this value.
+components_dir=C:/path/to/EagleLibs/reference/step/tesselated
+
+# Path to the STEP component model library (used for STEP export).
+# File names must match Eagle footprint names (case-insensitive).
+# The -c/--step-dir CLI argument overrides this value.
+step_components_dir=C:/path/to/EagleLibs/reference/step
